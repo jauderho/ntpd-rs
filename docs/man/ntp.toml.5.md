@@ -1,5 +1,5 @@
 <!-- ---
-title: NTP.TOML(5) ntpd-rs 1.1.2 | ntpd-rs
+title: NTP.TOML(5) ntpd-rs 1.2.3 | ntpd-rs
 --- -->
 
 # NAME
@@ -13,7 +13,7 @@ toml format is in lots of ways similar to a simple ini with several extensions
 allowing a json-like syntax.
 
 The ntpd-rs configuration file consists of several sections, each of which
-configuring a separate part of the ntp-daemon process. Each of the secions is
+configures a separate part of the ntp-daemon process. Each of the sections is
 described in the rest of this document. Many settings will have defaults, which
 will be indicated by each configuration setting shown.
 
@@ -97,6 +97,10 @@ sources.
     connections are lost, up to the maximum specified by this configuration
     value.
 
+`ignore` = *ip addresses*
+:   `pool` mode only. Specifies a list of ip addresses of servers in the pool
+    which should not be used. For example: `["127.0.0.1"]`. Empty by default.
+
 ## `[[server]]`
 The NTP daemon can be configured to distribute time via any number of
 `[[server]]` sections. If no such sections have been defined, the daemon runs in
@@ -155,6 +159,13 @@ time.
     address, and would be equivalent to setting the filter to `[]`, with either
     action.
 
+`require-nts` = `true` | `false` | `"deny"` | `"ignore"` (**false**)
+:   Whether incoming requests to the server must have NTS enabled. When set to
+    `true` or `"ignore"` any non-NTS enabled messages will be ignored. When set
+    to `"deny"` non-NTS enabled messages will be explicitly denied with an NTP
+    `DENY` kiss code. When set to `false` (the default), normal NTP messages are
+    also allowed.
+
 ## `[observability]`
 Settings in this section configure how you can observe the behavior of the
 daemon. Currently the daemon can be observed either through the logs or by
@@ -203,6 +214,9 @@ relevant configuration in the `[[nts-ke-server]]` section.
 :   If set, stores the internal NTS keys in the file indicated by *path*. This
     allows keys to survive a server reboot. If not set, clients using NTS may
     need to redo a key exchange operation to get new NTS cookies.
+    The daemon will not create any parent directories if they don't exist.
+    It will create the file if it doesn't exist.
+
 
 ## `[[nts-ke-server]]`
 The daemon can be configured to operate as an NTS key exchange server by
@@ -233,6 +247,10 @@ untampered with.
 `key-exchange-timeout-ms` = *timeout* (**1000**)
 :   Timeout in milliseconds for how long a key exchange may take. If the timeout
     is exceeded the connection will be dropped.
+
+`concurrent-connections` = *number* (**512**)
+:   Maximum number of concurrent connections the key exchange server will handle.
+    Any connections above the threshold will be held in an OS level queue.
 
 `ntp-port` = *port*
     Port number the key exchange server should instruct clients to use. Should
@@ -377,10 +395,10 @@ such may change in future ntpd-rs versions.
 `slew-maximum-frequency-offset` = *offset* (**200e-6**)
 :   What is the maximum frequency offset during a slew. Unit: s/s
 
-`slew-minimum-duration` = *duration* (**495e-6**)
+`slew-minimum-duration` = *duration* (**8.0**)
 :   What is the minimum duration of a slew. Unit: seconds
 
-`maximum-frequency-steer` = *frequency* (**8.0**)
+`maximum-frequency-steer` = *frequency* (**495e-6**)
 :   Absolute maximum frequency correction. Unit: s/s
 
 `ignore-server-dispersion` = *bool* (**false**)

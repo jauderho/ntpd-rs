@@ -18,7 +18,7 @@ __internal-fuzz = ["arbitrary", "__internal-api"]
 __internal-test = ["__internal-api"]
 __internal-api = []
 ntpv5 = []
-nts-pool = [ "rustls/dangerous_configuration" ]
+nts-pool = []
 
 [dependencies]
 # Note: md5 is needed to calculate ReferenceIDs for IPv6 addresses per RFC5905
@@ -28,10 +28,10 @@ tracing.workspace = true
 serde.workspace = true
 arbitrary = { workspace = true, optional = true }
 rustls.workspace = true
-thiserror.workspace = true
 aead.workspace = true
 aes-siv.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
 rustls-pemfile.workspace = true
+serde_test.workspace = true

@@ -1,20 +1,20 @@
-mod peer;
+mod ntp_source;
 mod server;
 pub mod subnet;
 
 use clock_steering::unix::UnixClock;
-use ntp_proto::{SourceDefaultsConfig, SynchronizationConfig};
-pub use peer::*;
+use ntp_proto::{AlgorithmConfig, SourceDefaultsConfig, SynchronizationConfig};
+pub use ntp_source::*;
 use serde::{Deserialize, Deserializer};
 pub use server::*;
 use std::{
+    fmt::Display,
     io::ErrorKind,
     net::SocketAddr,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     str::FromStr,
 };
-use thiserror::Error;
 use timestamped_socket::interface::InterfaceName;
 use tokio::{fs::read_to_string, io};
 use tracing::{info, warn};
@@ -333,15 +333,25 @@ fn default_metrics_exporter_listen() -> SocketAddr {
 
 #[derive(Deserialize, Debug, Default)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct DaemonSynchronizationConfig {
+    #[serde(flatten)]
+    pub synchronization_base: SynchronizationConfig,
+
+    #[serde(default)]
+    pub algorithm: AlgorithmConfig,
+}
+
+#[derive(Deserialize, Debug, Default)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct Config {
     #[serde(rename = "source", default)]
-    pub sources: Vec<PeerConfig>,
+    pub sources: Vec<NtpSourceConfig>,
     #[serde(rename = "server", default)]
     pub servers: Vec<ServerConfig>,
     #[serde(rename = "nts-ke-server", default)]
     pub nts_ke: Vec<NtsKeConfig>,
     #[serde(default)]
-    pub synchronization: SynchronizationConfig,
+    pub synchronization: DaemonSynchronizationConfig,
     #[serde(default)]
     pub source_defaults: SourceDefaultsConfig,
     #[serde(default)]
@@ -393,16 +403,16 @@ impl Config {
 
     pub async fn from_args(
         file: Option<impl AsRef<Path>>,
-        peers: Vec<PeerConfig>,
+        sources: Vec<NtpSourceConfig>,
         servers: Vec<ServerConfig>,
     ) -> Result<Config, ConfigError> {
         let mut config = Config::from_first_file(file.as_ref()).await?;
 
-        if !peers.is_empty() {
+        if !sources.is_empty() {
             if !config.sources.is_empty() {
-                info!("overriding peers from configuration");
+                info!("overriding sources from configuration");
             }
-            config.sources = peers;
+            config.sources = sources;
         }
 
         if !servers.is_empty() {
@@ -415,16 +425,16 @@ impl Config {
         Ok(config)
     }
 
-    /// Count potential number of peers in configuration
-    fn count_peers(&self) -> usize {
+    /// Count potential number of sources in configuration
+    fn count_sources(&self) -> usize {
         let mut count = 0;
-        for peer in &self.sources {
-            match peer {
-                PeerConfig::Standard(_) => count += 1,
-                PeerConfig::Nts(_) => count += 1,
-                PeerConfig::Pool(config) => count += config.max_peers,
+        for source in &self.sources {
+            match source {
+                NtpSourceConfig::Standard(_) => count += 1,
+                NtpSourceConfig::Nts(_) => count += 1,
+                NtpSourceConfig::Pool(config) => count += config.count,
                 #[cfg(feature = "unstable_nts-pool")]
-                PeerConfig::NtsPool(config) => count += config.max_peers,
+                NtpSourceConfig::NtsPool(config) => count += config.count,
             }
         }
         count
@@ -444,7 +454,11 @@ impl Config {
         }
 
         if !self.sources.is_empty()
-            && self.count_peers() < self.synchronization.minimum_agreeing_sources
+            && self.count_sources()
+                < self
+                    .synchronization
+                    .synchronization_base
+                    .minimum_agreeing_sources
         {
             warn!("Fewer sources configured than are required to agree on the current time. Daemon will not change system time.");
             ok = false;
@@ -454,18 +468,37 @@ impl Config {
     }
 }
 
-#[derive(Error, Debug)]
+#[derive(Debug)]
 pub enum ConfigError {
-    #[error("io error while reading config: {0}")]
-    Io(#[from] io::Error),
-    #[error("config toml parsing error: {0}")]
-    Toml(#[from] toml::de::Error),
+    Io(io::Error),
+    Toml(toml::de::Error),
+}
+
+impl std::error::Error for ConfigError {}
+
+impl Display for ConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(e) => write!(f, "io error while reading config: {e}"),
+            Self::Toml(e) => write!(f, "config toml parsing error: {e}"),
+        }
+    }
+}
+
+impl From<io::Error> for ConfigError {
+    fn from(value: io::Error) -> Self {
+        Self::Io(value)
+    }
+}
+
+impl From<toml::de::Error> for ConfigError {
+    fn from(value: toml::de::Error) -> Self {
+        Self::Toml(value)
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr;
-
     use ntp_proto::{NtpDuration, StepThreshold};
 
     use super::*;
@@ -476,7 +509,7 @@ mod tests {
             toml::from_str("[[source]]\nmode = \"server\"\naddress = \"example.com\"").unwrap();
         assert_eq!(
             config.sources,
-            vec![PeerConfig::Standard(StandardPeerConfig {
+            vec![NtpSourceConfig::Standard(StandardSource {
                 address: NormalizedAddress::new_unchecked("example.com", 123).into(),
             })]
         );
@@ -489,7 +522,7 @@ mod tests {
         assert_eq!(config.observability.log_level, Some(LogLevel::Info));
         assert_eq!(
             config.sources,
-            vec![PeerConfig::Standard(StandardPeerConfig {
+            vec![NtpSourceConfig::Standard(StandardSource {
                 address: NormalizedAddress::new_unchecked("example.com", 123).into(),
             })]
         );
@@ -500,16 +533,24 @@ mod tests {
             .unwrap();
         assert_eq!(
             config.sources,
-            vec![PeerConfig::Standard(StandardPeerConfig {
+            vec![NtpSourceConfig::Standard(StandardSource {
                 address: NormalizedAddress::new_unchecked("example.com", 123).into(),
             })]
         );
         assert_eq!(
-            config.synchronization.single_step_panic_threshold.forward,
+            config
+                .synchronization
+                .synchronization_base
+                .single_step_panic_threshold
+                .forward,
             Some(NtpDuration::from_seconds(0.))
         );
         assert_eq!(
-            config.synchronization.single_step_panic_threshold.backward,
+            config
+                .synchronization
+                .synchronization_base
+                .single_step_panic_threshold
+                .backward,
             Some(NtpDuration::from_seconds(0.))
         );
 
@@ -519,17 +560,19 @@ mod tests {
             .unwrap();
         assert_eq!(
             config.sources,
-            vec![PeerConfig::Standard(StandardPeerConfig {
+            vec![NtpSourceConfig::Standard(StandardSource {
                 address: NormalizedAddress::new_unchecked("example.com", 123).into(),
             })]
         );
         assert!(config
             .synchronization
+            .synchronization_base
             .single_step_panic_threshold
             .forward
             .is_none());
         assert!(config
             .synchronization
+            .synchronization_base
             .single_step_panic_threshold
             .backward
             .is_none());
@@ -559,7 +602,7 @@ mod tests {
 
         assert_eq!(
             config.sources,
-            vec![PeerConfig::Standard(StandardPeerConfig {
+            vec![NtpSourceConfig::Standard(StandardSource {
                 address: NormalizedAddress::new_unchecked("example.com", 123).into(),
             })]
         );
@@ -614,7 +657,7 @@ mod tests {
     }
 
     #[test]
-    fn toml_peers_invalid() {
+    fn toml_sources_invalid() {
         let config: Result<Config, _> = toml::from_str(
             r#"
             [[source]]
@@ -627,7 +670,7 @@ mod tests {
     }
 
     #[test]
-    fn toml_allow_no_peers() {
+    fn toml_allow_no_sources() {
         let config: Result<Config, _> = toml::from_str(
             r#"
             [[server]]
@@ -745,5 +788,29 @@ mod tests {
         assert_eq!(config.interface, Some(expected));
 
         assert_eq!(config.timestamp_mode, TimestampMode::Software);
+    }
+
+    #[test]
+    fn daemon_synchronization_config() {
+        let config: Result<DaemonSynchronizationConfig, _> = toml::from_str(
+            r#"
+            does_not_exist = 5
+            "#,
+        );
+
+        assert!(config.is_err());
+
+        let config: Result<DaemonSynchronizationConfig, _> = toml::from_str(
+            r#"
+            minimum-agreeing-sources = 2
+
+            [algorithm]
+            initial-wander = 1e-7
+            "#,
+        );
+
+        let config = config.unwrap();
+        assert_eq!(config.synchronization_base.minimum_agreeing_sources, 2);
+        assert_eq!(config.algorithm.initial_wander, 1e-7);
     }
 }

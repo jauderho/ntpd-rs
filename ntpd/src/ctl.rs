@@ -1,11 +1,15 @@
 use std::{path::PathBuf, process::ExitCode};
 
-use crate::daemon::{config::CliArg, tracing::LogLevel, Config, ObservableState};
+use crate::{
+    daemon::{config::CliArg, tracing::LogLevel, Config, ObservableState},
+    force_sync,
+};
 use tracing_subscriber::util::SubscriberInitExt;
 
 const USAGE_MSG: &str = "\
 usage: ntp-ctl validate [-c PATH]
        ntp-ctl status [-f FORMAT] [-c PATH]
+       ntp-ctl force-sync [-c PATH]
        ntp-ctl -h | ntp-ctl -v";
 
 const DESCRIPTOR: &str = "ntp-ctl - ntp-daemon monitoring";
@@ -34,6 +38,7 @@ pub enum NtpCtlAction {
     Version,
     Validate,
     Status,
+    ForceSync,
 }
 
 #[derive(Debug, Default)]
@@ -44,6 +49,7 @@ pub(crate) struct NtpCtlOptions {
     version: bool,
     validate: bool,
     status: bool,
+    force_sync: bool,
     action: NtpCtlAction,
 }
 
@@ -104,6 +110,9 @@ impl NtpCtlOptions {
                             "status" => {
                                 options.status = true;
                             }
+                            "force-sync" => {
+                                options.force_sync = true;
+                            }
                             unknown => {
                                 eprintln!("Warning: Unknown command {unknown}");
                             }
@@ -129,6 +138,8 @@ impl NtpCtlOptions {
             self.action = NtpCtlAction::Validate;
         } else if self.status {
             self.action = NtpCtlAction::Status;
+        } else if self.force_sync {
+            self.action = NtpCtlAction::ForceSync;
         } else {
             self.action = NtpCtlAction::Help;
         }
@@ -172,6 +183,7 @@ pub async fn main() -> std::io::Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         NtpCtlAction::Validate => validate(options.config).await,
+        NtpCtlAction::ForceSync => force_sync::force_sync(options.config).await,
         NtpCtlAction::Status => {
             let config = Config::from_args(options.config, vec![], vec![]).await;
 
@@ -216,11 +228,8 @@ async fn print_state(print: Format, observe_socket: PathBuf) -> Result<ExitCode,
 
     match print {
         Format::Plain => {
-            // Sort peers by address and then id (to deal with pools), servers just by address
-            output.sources.sort_by_key(|p| match p {
-                crate::daemon::ObservablePeerState::Nothing => None,
-                crate::daemon::ObservablePeerState::Observable(s) => Some((s.name.clone(), s.id)),
-            });
+            // Sort sources by address and then id (to deal with pools), servers just by address
+            output.sources.sort_by_key(|s| (s.name.clone(), s.id));
             output.servers.sort_by_key(|s| s.address);
 
             println!("Synchronization status:");
@@ -229,60 +238,27 @@ async fn print_state(print: Format, observe_socket: PathBuf) -> Result<ExitCode,
                 output.system.time_snapshot.root_dispersion.to_seconds(),
                 output.system.time_snapshot.root_delay.to_seconds()
             );
-            println!(
-                "Desired poll interval: {:.0}s",
-                output
-                    .system
-                    .time_snapshot
-                    .poll_interval
-                    .as_duration()
-                    .to_seconds()
-            );
             println!("Stratum: {}", output.system.stratum);
             println!();
             println!("Sources:");
-            for peer in &output.sources {
-                match peer {
-                    crate::daemon::ObservablePeerState::Nothing => {}
-                    crate::daemon::ObservablePeerState::Observable(
-                        crate::daemon::ObservedPeerState {
-                            timedata,
-                            unanswered_polls,
-                            poll_interval,
-                            name: address,
-                            address: ip,
-                            id,
-                        },
-                    ) => {
-                        println!(
-                            concat!(
-                                "{}/{} ({}): {:+.6}±{:.6}(±{:.6})s\n",
-                                "    poll interval: {:.0}s, missing polls: {}\n",
-                                "    root dispersion: {:.6}s, root delay:{:.6}s"
-                            ),
-                            address,
-                            ip,
-                            id,
-                            timedata.offset.to_seconds(),
-                            timedata.uncertainty.to_seconds(),
-                            timedata.delay.to_seconds(),
-                            poll_interval.as_duration().to_seconds(),
-                            unanswered_polls,
-                            timedata.remote_uncertainty.to_seconds(),
-                            timedata.remote_delay.to_seconds(),
-                        );
-                    }
-                }
-            }
-            let in_startup = output
-                .sources
-                .iter()
-                .filter(|peer| matches!(peer, crate::daemon::ObservablePeerState::Nothing))
-                .count();
-            match in_startup {
-                0 => {} // no peers in startup, so no line for that
-                1 => println!("1 source still in startup"),
-                _ => println!("{} sources still in startup", in_startup),
+            for source in &output.sources {
+                println!(
+                    concat!(
+                        "{}/{} ({}): {:+.6}±{:.6}(±{:.6})s\n",
+                        "    poll interval: {:.0}s, missing polls: {}\n",
+                        "    root dispersion: {:.6}s, root delay:{:.6}s"
+                    ),
+                    source.name,
+                    source.address,
+                    source.id,
+                    source.timedata.offset.to_seconds(),
+                    source.timedata.uncertainty.to_seconds(),
+                    source.timedata.delay.to_seconds(),
+                    source.poll_interval.as_duration().to_seconds(),
+                    source.unanswered_polls,
+                    source.timedata.remote_uncertainty.to_seconds(),
+                    source.timedata.remote_delay.to_seconds(),
+                );
             }
             println!();
             println!("Servers:");
@@ -345,7 +321,7 @@ mod tests {
         let permissions: std::fs::Permissions =
             PermissionsExt::from_mode(config.observation_permissions);
 
-        let peers_listener = create_unix_socket_with_permissions(&path, permissions)?;
+        let sources_listener = create_unix_socket_with_permissions(&path, permissions)?;
 
         let fut = super::print_state(command, path);
         let handle = tokio::spawn(fut);
@@ -357,7 +333,7 @@ mod tests {
             servers: vec![],
         };
 
-        let (mut stream, _addr) = peers_listener.accept().await?;
+        let (mut stream, _addr) = sources_listener.accept().await?;
         write_json(&mut stream, &value).await?;
 
         let result = handle.await.unwrap();
@@ -366,7 +342,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_control_socket_peer() -> std::io::Result<()> {
+    async fn test_control_socket_source() -> std::io::Result<()> {
         // be careful with copying: tests run concurrently and should use a unique socket name!
         let result = write_socket_helper(Format::Plain, "ntp-test-stream-6").await?;
 
@@ -392,7 +368,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_control_socket_peer_invalid_input() -> std::io::Result<()> {
+    async fn test_control_socket_source_invalid_input() -> std::io::Result<()> {
         let config: ObservabilityConfig = Default::default();
 
         // be careful with copying: tests run concurrently and should use a unique socket name!
@@ -404,14 +380,14 @@ mod tests {
         let permissions: std::fs::Permissions =
             PermissionsExt::from_mode(config.observation_permissions);
 
-        let peers_listener = create_unix_socket_with_permissions(&path, permissions)?;
+        let sources_listener = create_unix_socket_with_permissions(&path, permissions)?;
 
         let fut = super::print_state(Format::Plain, path);
         let handle = tokio::spawn(fut);
 
         let value = 42u32;
 
-        let (mut stream, _addr) = peers_listener.accept().await?;
+        let (mut stream, _addr) = sources_listener.accept().await?;
         write_json(&mut stream, &value).await?;
 
         let result = handle.await.unwrap();

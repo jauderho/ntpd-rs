@@ -106,7 +106,7 @@ impl NtpTimestamp {
         self - other < NtpDuration::ZERO
     }
 
-    #[cfg(any(test, feature = "__internal-fuzz"))]
+    #[cfg(test)]
     pub(crate) const fn from_fixed_int(timestamp: u64) -> NtpTimestamp {
         NtpTimestamp { timestamp }
     }
@@ -203,6 +203,7 @@ impl std::fmt::Debug for NtpDuration {
 
 impl NtpDuration {
     pub const ZERO: Self = Self { duration: 0 };
+    pub const MAX: Self = Self { duration: i64::MAX };
 
     pub(crate) const fn from_bits(bits: [u8; 8]) -> Self {
         Self {
@@ -271,11 +272,11 @@ impl NtpDuration {
 
         // Ensure proper saturating behaviour
         let duration = match i as i64 {
-            i if i >= std::i32::MIN as i64 && i <= std::i32::MAX as i64 => {
+            i if i >= i32::MIN as i64 && i <= i32::MAX as i64 => {
                 (i << 32) | (f * u32::MAX as f64) as i64
             }
-            i if i < std::i32::MIN as i64 => std::i64::MIN,
-            i if i > std::i32::MAX as i64 => std::i64::MAX,
+            i if i < i32::MIN as i64 => i64::MIN,
+            i if i > i32::MAX as i64 => i64::MAX,
             _ => unreachable!(),
         };
 
@@ -306,12 +307,12 @@ impl NtpDuration {
     }
 
     /// Interpret an exponent `k` as `2^k` seconds, expressed as an NtpDuration
-    pub fn from_exponent(input: i8) -> Self {
+    pub const fn from_exponent(input: i8) -> Self {
         Self {
             duration: match input {
-                exp if exp > 30 => std::i64::MAX,
+                exp if exp > 30 => i64::MAX,
                 exp if exp > 0 && exp <= 30 => 0x1_0000_0000_i64 << exp,
-                exp if (-32..=0).contains(&exp) => 0x1_0000_0000_i64 >> -exp,
+                exp if exp >= -32 && exp <= 0 => 0x1_0000_0000_i64 >> -exp,
                 _ => 0,
             },
         }
@@ -555,6 +556,8 @@ impl std::fmt::Debug for PollInterval {
 }
 
 impl PollInterval {
+    pub const NEVER: PollInterval = PollInterval(i8::MAX);
+
     #[cfg(test)]
     pub fn test_new(value: i8) -> Self {
         Self(value)
@@ -802,11 +805,11 @@ mod tests {
     fn duration_from_float_seconds_saturates() {
         assert_eq!(
             NtpDuration::from_seconds(1e40),
-            NtpDuration::from_fixed_int(std::i64::MAX)
+            NtpDuration::from_fixed_int(i64::MAX)
         );
         assert_eq!(
             NtpDuration::from_seconds(-1e40),
-            NtpDuration::from_fixed_int(std::i64::MIN)
+            NtpDuration::from_fixed_int(i64::MIN)
         );
     }
 

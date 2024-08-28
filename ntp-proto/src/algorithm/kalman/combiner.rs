@@ -1,20 +1,15 @@
 use crate::{packet::NtpLeapIndicator, time_types::NtpDuration};
 
-use super::{
-    config::AlgorithmConfig,
-    matrix::{Matrix, Vector},
-    sqr, PeerSnapshot,
-};
+use super::{config::AlgorithmConfig, source::KalmanState, SourceSnapshot};
 
 pub(super) struct Combine<Index: Copy> {
-    pub estimate: Vector<2>,
-    pub uncertainty: Matrix<2, 2>,
-    pub peers: Vec<Index>,
+    pub estimate: KalmanState,
+    pub sources: Vec<Index>,
     pub delay: NtpDuration,
     pub leap_indicator: Option<NtpLeapIndicator>,
 }
 
-fn vote_leap<Index: Copy>(selection: &[PeerSnapshot<Index>]) -> Option<NtpLeapIndicator> {
+fn vote_leap<Index: Copy>(selection: &[SourceSnapshot<Index>]) -> Option<NtpLeapIndicator> {
     let mut votes_59 = 0;
     let mut votes_61 = 0;
     let mut votes_none = 0;
@@ -24,7 +19,7 @@ fn vote_leap<Index: Copy>(selection: &[PeerSnapshot<Index>]) -> Option<NtpLeapIn
             NtpLeapIndicator::Leap61 => votes_61 += 1,
             NtpLeapIndicator::Leap59 => votes_59 += 1,
             NtpLeapIndicator::Unknown => {
-                panic!("Unsynchronized peer selected for synchronization!")
+                panic!("Unsynchronized source selected for synchronization!")
             }
         }
     }
@@ -40,48 +35,41 @@ fn vote_leap<Index: Copy>(selection: &[PeerSnapshot<Index>]) -> Option<NtpLeapIn
 }
 
 pub(super) fn combine<Index: Copy>(
-    selection: &[PeerSnapshot<Index>],
+    selection: &[SourceSnapshot<Index>],
     algo_config: &AlgorithmConfig,
 ) -> Option<Combine<Index>> {
     selection.first().map(|first| {
         let mut estimate = first.state;
-        let mut uncertainty = if algo_config.ignore_server_dispersion {
-            first.uncertainty
-        } else {
-            first.uncertainty
-                + Matrix::new([[sqr(first.peer_uncertainty.to_seconds()), 0.], [0., 0.]])
-        };
-
-        let mut used_peers = vec![(first.index, uncertainty.determinant())];
-
-        for snapshot in selection.iter().skip(1) {
-            let peer_estimate = snapshot.state;
-            let peer_uncertainty = if algo_config.ignore_server_dispersion {
-                snapshot.uncertainty
-            } else {
-                snapshot.uncertainty
-                    + Matrix::new([[sqr(snapshot.peer_uncertainty.to_seconds()), 0.], [0., 0.]])
-            };
-
-            used_peers.push((snapshot.index, peer_uncertainty.determinant()));
-
-            // Merge measurements
-            let mixer = (uncertainty + peer_uncertainty).inverse();
-            estimate = estimate + uncertainty * mixer * (peer_estimate - estimate);
-            uncertainty = uncertainty * mixer * peer_uncertainty;
+        if !algo_config.ignore_server_dispersion {
+            estimate = estimate.add_server_dispersion(first.source_uncertainty.to_seconds())
         }
 
-        used_peers.sort_by(|a, b| a.1.total_cmp(&b.1));
+        let mut used_sources = vec![(first.index, estimate.uncertainty.determinant())];
+
+        for snapshot in selection.iter().skip(1) {
+            let source_estimate = if algo_config.ignore_server_dispersion {
+                snapshot.state
+            } else {
+                snapshot
+                    .state
+                    .add_server_dispersion(snapshot.source_uncertainty.to_seconds())
+            };
+
+            used_sources.push((snapshot.index, source_estimate.uncertainty.determinant()));
+
+            estimate = estimate.merge(&source_estimate);
+        }
+
+        used_sources.sort_by(|a, b| a.1.total_cmp(&b.1));
 
         Combine {
             estimate,
-            uncertainty,
-            peers: used_peers.iter().map(|v| v.0).collect(),
+            sources: used_sources.iter().map(|v| v.0).collect(),
             delay: selection
                 .iter()
-                .map(|v| NtpDuration::from_seconds(v.delay) + v.peer_delay)
+                .map(|v| NtpDuration::from_seconds(v.delay) + v.source_delay)
                 .min()
-                .unwrap_or(NtpDuration::from_seconds(first.delay) + first.peer_delay),
+                .unwrap_or(NtpDuration::from_seconds(first.delay) + first.source_delay),
             leap_indicator: vote_leap(selection),
         }
     })
@@ -89,22 +77,32 @@ pub(super) fn combine<Index: Copy>(
 
 #[cfg(test)]
 mod tests {
-    use crate::time_types::NtpTimestamp;
+    use crate::{
+        algorithm::kalman::{
+            matrix::{Matrix, Vector},
+            source::KalmanState,
+        },
+        time_types::NtpTimestamp,
+    };
 
     use super::*;
 
     fn snapshot_for_state(
         state: Vector<2>,
         uncertainty: Matrix<2, 2>,
-        peer_uncertainty: f64,
-    ) -> PeerSnapshot<usize> {
-        PeerSnapshot {
+        source_uncertainty: f64,
+    ) -> SourceSnapshot<usize> {
+        SourceSnapshot {
             index: 0,
-            state,
-            uncertainty,
+            state: KalmanState {
+                state,
+                uncertainty,
+                time: NtpTimestamp::from_fixed_int(0),
+            },
+            wander: 0.0,
             delay: 0.0,
-            peer_uncertainty: NtpDuration::from_seconds(peer_uncertainty),
-            peer_delay: NtpDuration::from_seconds(0.01),
+            source_uncertainty: NtpDuration::from_seconds(source_uncertainty),
+            source_delay: NtpDuration::from_seconds(0.01),
             leap_indicator: NtpLeapIndicator::NoWarning,
             last_update: NtpTimestamp::from_fixed_int(0),
         }
@@ -112,7 +110,7 @@ mod tests {
 
     #[test]
     fn test_none() {
-        let selected: Vec<PeerSnapshot<usize>> = vec![];
+        let selected: Vec<SourceSnapshot<usize>> = vec![];
         let algconfig = AlgorithmConfig::default();
         assert!(combine(&selected, &algconfig).is_none());
     }
@@ -129,15 +127,14 @@ mod tests {
             ..Default::default()
         };
         let result = combine(&selected, &algconfig).unwrap();
-        assert!((result.uncertainty.entry(0, 0) - 2e-6).abs() < 1e-12);
-        assert!((result.uncertainty.entry(0, 0) - 2e-6).abs() < 1e-12);
+        assert!((result.estimate.offset_variance() - 2e-6).abs() < 1e-12);
 
         let algconfig = AlgorithmConfig {
             ignore_server_dispersion: true,
             ..Default::default()
         };
         let result = combine(&selected, &algconfig).unwrap();
-        assert!((result.uncertainty.entry(0, 0) - 1e-6).abs() < 1e-12);
+        assert!((result.estimate.offset_variance() - 1e-6).abs() < 1e-12);
     }
 
     #[test]
@@ -159,20 +156,20 @@ mod tests {
             ..Default::default()
         };
         let result = combine(&selected, &algconfig).unwrap();
-        assert!((result.estimate.ventry(0) - 5e-4).abs() < 1e-8);
-        assert!(result.estimate.ventry(1).abs() < 1e-8);
-        assert!((result.uncertainty.entry(0, 0) - 1e-6).abs() < 1e-12);
-        assert!((result.uncertainty.entry(1, 1) - 5e-13).abs() < 1e-16);
+        assert!((result.estimate.offset() - 5e-4).abs() < 1e-8);
+        assert!(result.estimate.frequency().abs() < 1e-8);
+        assert!((result.estimate.offset_variance() - 1e-6).abs() < 1e-12);
+        assert!((result.estimate.frequency_variance() - 5e-13).abs() < 1e-16);
 
         let algconfig = AlgorithmConfig {
             ignore_server_dispersion: true,
             ..Default::default()
         };
         let result = combine(&selected, &algconfig).unwrap();
-        assert!((result.estimate.ventry(0) - 5e-4).abs() < 1e-8);
-        assert!(result.estimate.ventry(1).abs() < 1e-8);
-        assert!((result.uncertainty.entry(0, 0) - 5e-7).abs() < 1e-12);
-        assert!((result.uncertainty.entry(1, 1) - 5e-13).abs() < 1e-16);
+        assert!((result.estimate.offset() - 5e-4).abs() < 1e-8);
+        assert!(result.estimate.frequency().abs() < 1e-8);
+        assert!((result.estimate.offset_variance() - 5e-7).abs() < 1e-12);
+        assert!((result.estimate.frequency_variance() - 5e-13).abs() < 1e-16);
     }
 
     #[test]
@@ -196,7 +193,7 @@ mod tests {
             ..Default::default()
         };
         let result = combine(&selected, &algconfig).unwrap();
-        assert_eq!(result.peers, vec![0, 1]);
+        assert_eq!(result.sources, vec![0, 1]);
 
         let mut selected = vec![
             snapshot_for_state(
@@ -217,17 +214,21 @@ mod tests {
             ..Default::default()
         };
         let result = combine(&selected, &algconfig).unwrap();
-        assert_eq!(result.peers, vec![1, 0]);
+        assert_eq!(result.sources, vec![1, 0]);
     }
 
-    fn snapshot_for_leap(leap: NtpLeapIndicator) -> PeerSnapshot<usize> {
-        PeerSnapshot {
+    fn snapshot_for_leap(leap: NtpLeapIndicator) -> SourceSnapshot<usize> {
+        SourceSnapshot {
             index: 0,
-            state: Vector::new_vector([0.0, 0.0]),
-            uncertainty: Matrix::new([[1e-6, 0.0], [0.0, 1e-12]]),
+            state: KalmanState {
+                state: Vector::new_vector([0.0, 0.0]),
+                uncertainty: Matrix::new([[1e-6, 0.0], [0.0, 1e-12]]),
+                time: NtpTimestamp::from_fixed_int(0),
+            },
+            wander: 0.0,
             delay: 0.0,
-            peer_uncertainty: NtpDuration::from_seconds(0.0),
-            peer_delay: NtpDuration::from_seconds(0.0),
+            source_uncertainty: NtpDuration::from_seconds(0.0),
+            source_delay: NtpDuration::from_seconds(0.0),
             leap_indicator: leap,
             last_update: NtpTimestamp::from_fixed_int(0),
         }

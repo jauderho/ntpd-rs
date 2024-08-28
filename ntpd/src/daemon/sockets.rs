@@ -1,29 +1,28 @@
 use std::fs::Permissions;
 use std::path::Path;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixStream;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub async fn write_json<T>(stream: &mut UnixStream, value: &T) -> std::io::Result<()>
+pub async fn write_json<T>(stream: &mut (impl AsyncWrite + Unpin), value: &T) -> std::io::Result<()>
 where
     T: serde::Serialize,
 {
     let bytes = serde_json::to_vec(value).unwrap();
+    stream.write_u64(bytes.len() as u64).await?;
     stream.write_all(&bytes).await
 }
 
 pub async fn read_json<'a, T>(
-    stream: &mut UnixStream,
+    stream: &mut (impl AsyncRead + Unpin),
     buffer: &'a mut Vec<u8>,
 ) -> std::io::Result<T>
 where
     T: serde::Deserialize<'a>,
 {
     buffer.clear();
-
-    let n = stream.read_buf(buffer).await?;
-    buffer.truncate(n);
-
+    let msg_size = stream.read_u64().await? as usize;
+    buffer.resize(msg_size, 0);
+    stream.read_exact(buffer).await?;
     serde_json::from_slice(buffer)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
 }
@@ -85,7 +84,7 @@ fn create_unix_socket(path: &Path) -> std::io::Result<tokio::net::UnixListener> 
 
 #[cfg(test)]
 mod tests {
-    use tokio::net::UnixListener;
+    use tokio::net::{UnixListener, UnixStream};
 
     use super::*;
 
@@ -101,14 +100,12 @@ mod tests {
 
         let (mut reader, _) = listener.accept().await.unwrap();
 
-        let object = vec![0usize, 10];
+        let object = vec![10u64; 1_000];
 
         write_json(&mut writer, &object).await.unwrap();
 
         let mut buf = Vec::new();
-        let output = read_json::<Vec<usize>>(&mut reader, &mut buf)
-            .await
-            .unwrap();
+        let output = read_json::<Vec<u64>>(&mut reader, &mut buf).await.unwrap();
 
         assert_eq!(object, output);
 
@@ -130,6 +127,7 @@ mod tests {
 
         // write data that cannot be parsed
         let data = [0; 24];
+        writer.write_u64(data.len() as u64).await.unwrap();
         writer.write_all(&data).await.unwrap();
 
         let mut buf = Vec::new();

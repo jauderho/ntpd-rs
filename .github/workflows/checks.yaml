@@ -6,7 +6,6 @@ permissions:
 on:
   push:
     branches:
-      - main
       - 'release/**'
   pull_request:
     branches-ignore:
@@ -14,8 +13,8 @@ on:
   schedule:
     - cron: '0 4 * * *'
   merge_group:
-    branches:
-      - main
+    types: [checks_requested]
+  workflow_call: {}
 
 jobs:
   build:
@@ -62,22 +61,31 @@ jobs:
             target: "x86_64-apple-darwin"
     steps:
       - name: Checkout sources
-        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11
+        uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332
         with:
           persist-credentials: false
       - name: Set target rust version
         run: echo "TARGET_RUST_VERSION=$(if [ "${{matrix.rust}}" = "msrv" ]; then grep rust-version Cargo.toml | grep MSRV | cut -d'"' -f2; else echo "${{matrix.rust}}"; fi)" >> $GITHUB_ENV
+      - name: Install nightly toolchain for direct-minimal-versions
+        uses: dtolnay/rust-toolchain@7b1c307e0dcbda6122208f10795a713336a9b35a
+        with:
+          toolchain: nightly
+          targets: "${{ matrix.target }}"
+        if: ${{ matrix.rust == 'msrv' }}
       - name: Install toolchain
-        uses: dtolnay/rust-toolchain@be73d7920c329f220ce78e0234b8f96b7ae60248
+        uses: dtolnay/rust-toolchain@7b1c307e0dcbda6122208f10795a713336a9b35a
         with:
           toolchain: "${TARGET_RUST_VERSION}"
           targets: "${{ matrix.target }}"
+      - name: Downgrade direct dependencies to minimal versions
+        run: cargo +nightly update -Z direct-minimal-versions
+        if: ${{ matrix.rust == 'msrv' }}
       - name: Install cross-compilation tools
-        uses: taiki-e/setup-cross-toolchain-action@c31d54d08f2ab1b6c35447b32b3f0dcb829a5b4f
+        uses: taiki-e/setup-cross-toolchain-action@cae290c908b85538356ba35acbdd9f7c9298152a
         with:
           target: ${{ matrix.target }}
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@e17a4e247d4a36441181d7758c499d97e1e006bd
+        uses: taiki-e/install-action@f172798ba087526822a4f43dd08714d08a45aa37
         with:
           tool: cargo-llvm-cov
       - name: Rust cache
@@ -91,9 +99,10 @@ jobs:
         env:
           RUST_BACKTRACE: 1
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@4fe8c5f003fae66aa5ebb77cfd3e7bfbbda0b6b0
+        uses: codecov/codecov-action@e28ff129e5465c2c0dcc6f003fc735cb6ae0c673
         with:
           files: lcov.info
+          token: ${{ secrets.CODECOV_TOKEN }}
           fail_ci_if_error: false
 
   unused:
@@ -101,15 +110,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout sources
-        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11
+        uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332
         with:
           persist-credentials: false
       - name: Install nightly toolchain
-        uses: dtolnay/rust-toolchain@be73d7920c329f220ce78e0234b8f96b7ae60248
+        uses: dtolnay/rust-toolchain@7b1c307e0dcbda6122208f10795a713336a9b35a
         with:
           toolchain: nightly
       - name: Install udeps
-        uses: taiki-e/install-action@e17a4e247d4a36441181d7758c499d97e1e006bd
+        uses: taiki-e/install-action@f172798ba087526822a4f43dd08714d08a45aa37
         with:
           tool: cargo-udeps
       - name: cargo udeps
@@ -123,7 +132,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout sources
-        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11
+        uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332
         with:
           persist-credentials: false
       - name: ./ntp.toml
@@ -144,7 +153,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout sources
-        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11
+        uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332
         with:
           persist-credentials: false
       - name: Build man pages
@@ -157,11 +166,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout sources
-        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11
+        uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332
         with:
           persist-credentials: false
       - name: Install rust toolchain
-        uses: dtolnay/rust-toolchain@be73d7920c329f220ce78e0234b8f96b7ae60248
+        uses: dtolnay/rust-toolchain@7b1c307e0dcbda6122208f10795a713336a9b35a
         with:
           toolchain: stable
           components: rustfmt
@@ -196,11 +205,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout sources
-        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11
+        uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332
         with:
           persist-credentials: false
       - name: Install rust toolchain
-        uses: dtolnay/rust-toolchain@be73d7920c329f220ce78e0234b8f96b7ae60248
+        uses: dtolnay/rust-toolchain@7b1c307e0dcbda6122208f10795a713336a9b35a
         with:
           toolchain: stable
           components: clippy
@@ -213,7 +222,7 @@ jobs:
           version: 0.9.0
         if: ${{matrix.use_zig}}
       - name: Install cargo-zigbuild
-        uses: taiki-e/install-action@e17a4e247d4a36441181d7758c499d97e1e006bd
+        uses: taiki-e/install-action@f172798ba087526822a4f43dd08714d08a45aa37
         with:
           tool: cargo-zigbuild
         if: ${{matrix.use_zig}}
@@ -246,17 +255,18 @@ jobs:
           - "--all-features"
     steps:
       - name: Checkout sources
-        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11
+        uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332
         with:
           persist-credentials: false
       - name: Install nightly toolchain
-        uses: dtolnay/rust-toolchain@be73d7920c329f220ce78e0234b8f96b7ae60248
+        uses: dtolnay/rust-toolchain@7b1c307e0dcbda6122208f10795a713336a9b35a
         with:
           toolchain: nightly
       - name: Install cargo fuzz
-        uses: taiki-e/install-action@e17a4e247d4a36441181d7758c499d97e1e006bd
-        with:
-          tool: cargo-fuzz
+        # We install cargo-fuzz directly as the prebuilt version of
+        # cargo fuzz is not compatible with our toolchain.
+        run: |
+          cargo install cargo-fuzz
       - name: Smoke-test fuzz targets
         run: |
           cargo fuzz build ${{ matrix.features }}
@@ -268,10 +278,11 @@ jobs:
     name: Audit dependencies
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11
-    - uses: EmbarkStudios/cargo-deny-action@748857f070c53667b2b8de8bdf468ac75a6b757c
+    - uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332
+    - uses: EmbarkStudios/cargo-deny-action@8371184bd11e21dcf8ac82ebf8c9c9f74ebf7268
       with:
         arguments: --workspace --all-features
-    - uses: EmbarkStudios/cargo-deny-action@748857f070c53667b2b8de8bdf468ac75a6b757c
+    - uses: EmbarkStudios/cargo-deny-action@8371184bd11e21dcf8ac82ebf8c9c9f74ebf7268
       with:
-        arguments: --manifest-path ./fuzz/Cargo.toml --all-features
+        manifest-path: ./fuzz/Cargo.toml
+        arguments: --all-features

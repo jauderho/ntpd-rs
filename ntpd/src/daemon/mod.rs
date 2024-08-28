@@ -1,10 +1,10 @@
 mod clock;
 pub mod config;
-mod ipfilter;
 pub mod keyexchange;
+mod local_ip_provider;
+mod ntp_source;
 pub mod nts_key_provider;
 pub mod observer;
-mod peer;
 mod server;
 pub mod sockets;
 pub mod spawn;
@@ -16,9 +16,8 @@ use std::{error::Error, path::PathBuf};
 
 use ::tracing::info;
 pub use config::Config;
-#[cfg(feature = "__internal-fuzz")]
-pub use ipfilter::fuzz::fuzz_ipfilter;
-pub use observer::{ObservablePeerState, ObservableState, ObservedPeerState};
+use ntp_proto::KalmanClockController;
+pub use observer::ObservableState;
 pub use system::spawn;
 use tracing_subscriber::util::SubscriberInitExt;
 
@@ -102,8 +101,9 @@ async fn run(options: NtpDaemonOptions) -> Result<(), Box<dyn Error>> {
     let clock_config = config::ClockConfig::default();
 
     ::tracing::debug!("Configuration loaded, spawning daemon jobs");
-    let (main_loop_handle, channels) = spawn(
-        config.synchronization,
+    let (main_loop_handle, channels) = spawn::<KalmanClockController<_, _>>(
+        config.synchronization.synchronization_base,
+        config.synchronization.algorithm,
         config.source_defaults,
         clock_config,
         &config.sources,
@@ -118,7 +118,7 @@ async fn run(options: NtpDaemonOptions) -> Result<(), Box<dyn Error>> {
 
     observer::spawn(
         &config.observability,
-        channels.peer_snapshots_receiver,
+        channels.source_snapshots,
         channels.server_data_receiver,
         channels.system_snapshot_receiver,
     )

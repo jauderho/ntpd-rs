@@ -18,7 +18,6 @@ tokio = { workspace = true, features = ["rt-multi-thread", "io-util", "io-std", 
 tracing.workspace = true
 tracing-subscriber.workspace = true
 toml.workspace = true
-thiserror.workspace = true
 rand.workspace = true
 libc.workspace = true
 async-trait.workspace = true
@@ -39,7 +38,6 @@ tokio-rustls.workspace = true
 [features]
 default = []
 hardware-timestamping = []
-__internal-fuzz = []
 unstable_ntpv5 = ["ntp-proto/ntpv5"]
 unstable_nts-pool = [ "ntp-proto/nts-pool" ]
 
@@ -63,7 +61,7 @@ path = "bin/ntp-metrics-exporter.rs"
 name = "ntpd-rs"
 priority = "optional"
 section = "net"
-copyright = "Copyright (c) 2022-2023 Tweede Golf and Contributors"
+copyright = "Copyright (c) 2022-2024 Trifecta Tech Foundation, Tweede Golf, and Contributors"
 license-file = "../pkg/deb/COPYRIGHT-debian"
 maintainer = "NTPD-rs Maintainers <ntpd-rs-maintainer@tweedegolf.com>"
 maintainer-scripts = "../pkg/deb/"

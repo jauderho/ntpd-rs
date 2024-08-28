@@ -22,10 +22,6 @@ features = ["arbitrary-derive"]
 path = "../ntp-proto"
 features = ["__internal-fuzz"]
 
-[dependencies.ntpd]
-path = "../ntpd"
-features = ["__internal-fuzz"]
-
 # Prevent this from interfering with workspaces
 [workspace]
 members = ["."]
@@ -51,12 +47,6 @@ doc = false
 [[bin]]
 name = "encrypted_server_parsing"
 path = "fuzz_targets/encrypted_server_parsing.rs"
-test = false
-doc = false
-
-[[bin]]
-name = "tuple_from_packet"
-path = "fuzz_targets/tuple_from_packet.rs"
 test = false
 doc = false
 

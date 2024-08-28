@@ -1,17 +1,18 @@
-use std::{fmt::Debug, hash::Hash};
+use std::{fmt::Debug, time::Duration};
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use crate::{
     clock::NtpClock,
     config::{SourceDefaultsConfig, SynchronizationConfig},
-    peer::Measurement,
+    source::Measurement,
     system::TimeSnapshot,
     time_types::{NtpDuration, NtpTimestamp},
+    PollInterval,
 };
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
-pub struct ObservablePeerTimedata {
+pub struct ObservableSourceTimedata {
     pub offset: NtpDuration,
     pub uncertainty: NtpDuration,
     pub delay: NtpDuration,
@@ -23,63 +24,88 @@ pub struct ObservablePeerTimedata {
 }
 
 #[derive(Debug, Clone)]
-pub struct StateUpdate<PeerID: Eq + Copy + Debug> {
+pub struct StateUpdate<SourceId, ControllerMessage> {
+    // Message for all sources, if any
+    pub source_message: Option<ControllerMessage>,
     // Update to the time snapshot, if any
     pub time_snapshot: Option<TimeSnapshot>,
-    // Update to the used peers, if any
-    pub used_peers: Option<Vec<PeerID>>,
+    // Update to the used sources, if any
+    pub used_sources: Option<Vec<SourceId>>,
     // Requested timestamp for next non-measurement update
-    pub next_update: Option<NtpTimestamp>,
+    pub next_update: Option<Duration>,
 }
 
 // Note: this default implementation is neccessary since the
-// derive only works if PeerID is Default (which it isn't
+// derive only works if SourceId is Default (which it isn't
 // neccessarily)
-impl<PeerID: Eq + Copy + Debug> Default for StateUpdate<PeerID> {
+impl<SourceId, ControllerMessage> Default for StateUpdate<SourceId, ControllerMessage> {
     fn default() -> Self {
         Self {
+            source_message: None,
             time_snapshot: None,
-            used_peers: None,
+            used_sources: None,
             next_update: None,
         }
     }
 }
 
-pub trait TimeSyncController<C: NtpClock, PeerID: Hash + Eq + Copy + Debug>: Sized {
-    type AlgorithmConfig: Debug + Copy + DeserializeOwned;
+pub trait TimeSyncController: Sized + Send + 'static {
+    type Clock: NtpClock;
+    type SourceId;
+    type AlgorithmConfig: Debug + Copy + DeserializeOwned + Send;
+    type ControllerMessage: Debug + Clone + Send + 'static;
+    type SourceMessage: Debug + Clone + Send + 'static;
+    type SourceController: SourceController<
+        ControllerMessage = Self::ControllerMessage,
+        SourceMessage = Self::SourceMessage,
+    >;
 
     /// Create a new clock controller controling the given clock
     fn new(
-        clock: C,
+        clock: Self::Clock,
         synchronization_config: SynchronizationConfig,
-        peer_defaults_config: SourceDefaultsConfig,
+        source_defaults_config: SourceDefaultsConfig,
         algorithm_config: Self::AlgorithmConfig,
-    ) -> Result<Self, C::Error>;
-    /// Update used system config
-    fn update_config(
-        &mut self,
-        synchronization_config: SynchronizationConfig,
-        peer_defaults_config: SourceDefaultsConfig,
-        algorithm_config: Self::AlgorithmConfig,
-    );
-    /// Notify the controller that there is a new peer
-    fn peer_add(&mut self, id: PeerID);
-    /// Notify the controller that a previous peer has gone
-    fn peer_remove(&mut self, id: PeerID);
-    /// Notify the controller that the status of a peer (whether
+    ) -> Result<Self, <Self::Clock as NtpClock>::Error>;
+
+    /// Take control of the clock (should not be done in new!)
+    fn take_control(&mut self) -> Result<(), <Self::Clock as NtpClock>::Error>;
+
+    /// Create a new source with given identity
+    fn add_source(&mut self, id: Self::SourceId) -> Self::SourceController;
+    /// Notify the controller that a previous source has gone
+    fn remove_source(&mut self, id: Self::SourceId);
+    /// Notify the controller that the status of a source (whether
     /// or not it is usable for synchronization) has changed.
-    fn peer_update(&mut self, id: PeerID, usable: bool);
-    /// Notify the controller of a new measurement from a peer.
-    /// The list of peerIDs is used for loop detection, with the
-    /// first peerID given considered the primary peer used.
-    fn peer_measurement(&mut self, id: PeerID, measurement: Measurement) -> StateUpdate<PeerID>;
-    /// Non-measurement driven update (queued via next_update)
-    fn time_update(&mut self) -> StateUpdate<PeerID>;
-    /// Get a snapshot of the timekeeping state of a peer.
-    fn peer_snapshot(&self, id: PeerID) -> Option<ObservablePeerTimedata>;
+    fn source_update(&mut self, id: Self::SourceId, usable: bool);
+    /// Notify the controller of a new measurement from a source.
+    /// The list of SourceIds is used for loop detection, with the
+    /// first SourceId given considered the primary source used.
+    fn source_message(
+        &mut self,
+        id: Self::SourceId,
+        message: Self::SourceMessage,
+    ) -> StateUpdate<Self::SourceId, Self::ControllerMessage>;
+    /// Non-message driven update (queued via next_update)
+    fn time_update(&mut self) -> StateUpdate<Self::SourceId, Self::ControllerMessage>;
+}
+
+pub trait SourceController: Sized + Send + 'static {
+    type ControllerMessage: Debug + Clone + Send + 'static;
+    type SourceMessage: Debug + Clone + Send + 'static;
+
+    fn handle_message(&mut self, message: Self::ControllerMessage);
+
+    fn handle_measurement(&mut self, measurement: Measurement) -> Option<Self::SourceMessage>;
+
+    fn desired_poll_interval(&self) -> PollInterval;
+
+    fn observe(&self) -> ObservableSourceTimedata;
 }
 
 mod kalman;
 
-pub use kalman::config::AlgorithmConfig;
-pub use kalman::KalmanClockController;
+pub use kalman::{
+    config::AlgorithmConfig, KalmanClockController, KalmanControllerMessage,
+    KalmanSourceController, KalmanSourceMessage,
+};

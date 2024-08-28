@@ -14,7 +14,7 @@
 . ftr VB CB
 . ftr VBI CBI
 .\}
-.TH "NTP.TOML" "5" "" "ntpd-rs 1.1.2" "ntpd-rs"
+.TH "NTP.TOML" "5" "" "ntpd-rs 1.2.3" "ntpd-rs"
 .hy
 .SH NAME
 .PP
@@ -27,8 +27,8 @@ The toml format is in lots of ways similar to a simple ini with several
 extensions allowing a json-like syntax.
 .PP
 The ntpd-rs configuration file consists of several sections, each of
-which configuring a separate part of the ntp-daemon process.
-Each of the secions is described in the rest of this document.
+which configures a separate part of the ntp-daemon process.
+Each of the sections is described in the rest of this document.
 Many settings will have defaults, which will be indicated by each
 configuration setting shown.
 .PP
@@ -125,6 +125,13 @@ connect to from a pool.
 The daemon will keep retrying to get more sources from the pool when
 connections are lost, up to the maximum specified by this configuration
 value.
+.TP
+\f[V]ignore\f[R] = \f[I]ip addresses\f[R]
+\f[V]pool\f[R] mode only.
+Specifies a list of ip addresses of servers in the pool which should not
+be used.
+For example: \f[V][\[dq]127.0.0.1\[dq]]\f[R].
+Empty by default.
 .SS \f[V][[server]]\f[R]
 .PP
 The NTP daemon can be configured to distribute time via any number of
@@ -202,6 +209,15 @@ When \f[V]ignore\f[R] is specified, messages are discarded with no
 response sent.
 The default value is equivalent to allowing any IP address, and would be
 equivalent to setting the filter to \f[V][]\f[R], with either action.
+.TP
+\f[V]require-nts\f[R] = \f[V]true\f[R] | \f[V]false\f[R] | \f[V]\[dq]deny\[dq]\f[R] | \f[V]\[dq]ignore\[dq]\f[R] (\f[B]false\f[R])
+Whether incoming requests to the server must have NTS enabled.
+When set to \f[V]true\f[R] or \f[V]\[dq]ignore\[dq]\f[R] any non-NTS
+enabled messages will be ignored.
+When set to \f[V]\[dq]deny\[dq]\f[R] non-NTS enabled messages will be
+explicitly denied with an NTP \f[V]DENY\f[R] kiss code.
+When set to \f[V]false\f[R] (the default), normal NTP messages are also
+allowed.
 .SS \f[V][observability]\f[R]
 .PP
 Settings in this section configure how you can observe the behavior of
@@ -259,6 +275,9 @@ If set, stores the internal NTS keys in the file indicated by
 This allows keys to survive a server reboot.
 If not set, clients using NTS may need to redo a key exchange operation
 to get new NTS cookies.
+The daemon will not create any parent directories if they don\[cq]t
+exist.
+It will create the file if it doesn\[cq]t exist.
 .SS \f[V][[nts-ke-server]]\f[R]
 .PP
 The daemon can be configured to operate as an NTS key exchange server by
@@ -294,6 +313,11 @@ certificate chain.
 \f[V]key-exchange-timeout-ms\f[R] = \f[I]timeout\f[R] (\f[B]1000\f[R])
 Timeout in milliseconds for how long a key exchange may take.
 If the timeout is exceeded the connection will be dropped.
+.TP
+\f[V]concurrent-connections\f[R] = \f[I]number\f[R] (\f[B]512\f[R])
+Maximum number of concurrent connections the key exchange server will
+handle.
+Any connections above the threshold will be held in an OS level queue.
 .PP
 \f[V]ntp-port\f[R] = \f[I]port\f[R] Port number the key exchange server
 should instruct clients to use.
@@ -461,11 +485,11 @@ Unit: seconds, 0+
 What is the maximum frequency offset during a slew.
 Unit: s/s
 .TP
-\f[V]slew-minimum-duration\f[R] = \f[I]duration\f[R] (\f[B]495e-6\f[R])
+\f[V]slew-minimum-duration\f[R] = \f[I]duration\f[R] (\f[B]8.0\f[R])
 What is the minimum duration of a slew.
 Unit: seconds
 .TP
-\f[V]maximum-frequency-steer\f[R] = \f[I]frequency\f[R] (\f[B]8.0\f[R])
+\f[V]maximum-frequency-steer\f[R] = \f[I]frequency\f[R] (\f[B]495e-6\f[R])
 Absolute maximum frequency correction.
 Unit: s/s
 .TP

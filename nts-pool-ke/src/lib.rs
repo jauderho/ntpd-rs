@@ -3,12 +3,7 @@ mod config;
 
 mod tracing;
 
-use std::{
-    io::{BufRead, ErrorKind},
-    ops::ControlFlow,
-    path::PathBuf,
-    sync::Arc,
-};
+use std::{io::ErrorKind, ops::ControlFlow, path::PathBuf, sync::Arc};
 
 use ::tracing::{info, warn};
 use cli::NtsPoolKeOptions;
@@ -17,7 +12,10 @@ use ntp_proto::{
     AeadAlgorithm, ClientToPoolData, KeyExchangeError, NtsRecord, PoolToServerData,
     PoolToServerDecoder, SupportedAlgorithmsDecoder,
 };
-use rustls::{Certificate, ServerName};
+use rustls::{
+    pki_types::{CertificateDer, ServerName},
+    version::TLS13,
+};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, ToSocketAddrs},
@@ -148,19 +146,15 @@ async fn run_nts_pool_ke(nts_pool_ke_config: NtsPoolKeConfig) -> std::io::Result
             ))
         })?;
 
-    let certificate_authority: Arc<[rustls::Certificate]> =
-        rustls_pemfile::certs(&mut std::io::BufReader::new(certificate_authority_file))?
-            .into_iter()
-            .map(rustls::Certificate)
-            .collect();
+    let certificate_authority: Arc<[rustls::pki_types::CertificateDer]> =
+        rustls_pemfile::certs(&mut std::io::BufReader::new(certificate_authority_file))
+            .collect::<std::io::Result<Arc<[rustls::pki_types::CertificateDer]>>>()?;
 
-    let certificate_chain: Vec<rustls::Certificate> =
-        rustls_pemfile::certs(&mut std::io::BufReader::new(certificate_chain_file))?
-            .into_iter()
-            .map(rustls::Certificate)
-            .collect();
+    let certificate_chain: Vec<rustls::pki_types::CertificateDer> =
+        rustls_pemfile::certs(&mut std::io::BufReader::new(certificate_chain_file))
+            .collect::<std::io::Result<Vec<rustls::pki_types::CertificateDer>>>()?;
 
-    let private_key = private_key_from_bufread(&mut std::io::BufReader::new(private_key_file))?
+    let private_key = rustls_pemfile::private_key(&mut std::io::BufReader::new(private_key_file))?
         .ok_or(io_error("could not parse private key"))?;
 
     pool_key_exchange_server(
@@ -180,18 +174,17 @@ fn io_error(msg: &str) -> std::io::Error {
 
 async fn pool_key_exchange_server(
     address: impl ToSocketAddrs,
-    certificate_authority: Arc<[rustls::Certificate]>,
-    certificate_chain: Vec<rustls::Certificate>,
-    private_key: rustls::PrivateKey,
+    certificate_authority: Arc<[rustls::pki_types::CertificateDer<'static>]>,
+    certificate_chain: Vec<rustls::pki_types::CertificateDer<'static>>,
+    private_key: rustls::pki_types::PrivateKeyDer<'static>,
     servers: Vec<config::KeyExchangeServer>,
     timeout_ms: u64,
 ) -> std::io::Result<()> {
     let listener = TcpListener::bind(address).await?;
 
-    let mut config = rustls::ServerConfig::builder()
-        .with_safe_defaults()
+    let mut config = rustls::ServerConfig::builder_with_protocol_versions(&[&TLS13])
         .with_no_client_auth()
-        .with_single_cert(certificate_chain.clone(), private_key.clone())
+        .with_single_cert(certificate_chain.clone(), private_key.clone_key())
         .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err))?;
 
     config.alpn_protocols.clear();
@@ -203,11 +196,11 @@ async fn pool_key_exchange_server(
     info!("listening on '{:?}'", listener.local_addr());
 
     loop {
-        let (client_stream, peer_address) = listener.accept().await?;
+        let (client_stream, source_address) = listener.accept().await?;
         let client_to_pool_config = config.clone();
         let servers = servers.clone();
         let certificate_chain = certificate_chain.clone();
-        let private_key = private_key.clone();
+        let private_key = private_key.clone_key();
 
         let certificate_authority = certificate_authority.clone();
         let fut = handle_client(
@@ -222,9 +215,9 @@ async fn pool_key_exchange_server(
         tokio::spawn(async move {
             let timeout = std::time::Duration::from_millis(timeout_ms);
             match tokio::time::timeout(timeout, fut).await {
-                Err(_) => ::tracing::debug!(?peer_address, "NTS Pool KE timed out"),
-                Ok(Err(err)) => ::tracing::debug!(?err, ?peer_address, "NTS Pool KE failed"),
-                Ok(Ok(())) => ::tracing::debug!(?peer_address, "NTS Pool KE completed"),
+                Err(_) => ::tracing::debug!(?source_address, "NTS Pool KE timed out"),
+                Ok(Err(err)) => ::tracing::debug!(?err, ?source_address, "NTS Pool KE failed"),
+                Ok(Ok(())) => ::tracing::debug!(?source_address, "NTS Pool KE completed"),
             }
         });
     }
@@ -234,12 +227,13 @@ async fn try_nts_ke_server<'a>(
     connector: &TlsConnector,
     config::KeyExchangeServer { domain, port }: &'a config::KeyExchangeServer,
     selected_algorithm: AeadAlgorithm,
-) -> Result<(&'a str, u16, ServerName), KeyExchangeError> {
+) -> Result<(&'a str, u16, ServerName<'static>), KeyExchangeError> {
     info!("checking supported algorithms for '{domain}:{port}'");
 
     let domain = domain.as_str();
-    let server_name = rustls::ServerName::try_from(domain)
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid dnsname"))?;
+    let server_name = rustls::pki_types::ServerName::try_from(domain)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid dnsname"))?
+        .to_owned();
 
     let server_stream = match tokio::net::TcpStream::connect((domain, *port)).await {
         Ok(server_stream) => server_stream,
@@ -270,7 +264,7 @@ async fn pick_nts_ke_servers<'a>(
     servers: &'a [config::KeyExchangeServer],
     selected_algorithm: AeadAlgorithm,
     denied_servers: &[String],
-) -> Result<(&'a str, u16, ServerName), KeyExchangeError> {
+) -> Result<(&'a str, u16, ServerName<'static>), KeyExchangeError> {
     use std::sync::atomic::{AtomicUsize, Ordering};
     static START_INDEX: AtomicUsize = AtomicUsize::new(0);
     let start_index = START_INDEX.fetch_add(1, Ordering::Relaxed);
@@ -317,9 +311,9 @@ async fn pick_nts_ke_servers<'a>(
 async fn handle_client(
     client_stream: tokio::net::TcpStream,
     config: Arc<rustls::ServerConfig>,
-    certificate_authority: Arc<[rustls::Certificate]>,
-    certificate_chain: Vec<rustls::Certificate>,
-    private_key: rustls::PrivateKey,
+    certificate_authority: Arc<[rustls::pki_types::CertificateDer<'static>]>,
+    certificate_chain: Vec<rustls::pki_types::CertificateDer<'static>>,
+    private_key: rustls::pki_types::PrivateKeyDer<'static>,
     servers: Arc<[config::KeyExchangeServer]>,
 ) -> Result<(), KeyExchangeError> {
     // handle the initial client to pool
@@ -453,22 +447,22 @@ fn prepare_records_for_server(
 }
 
 fn pool_to_server_connector(
-    extra_certificates: &[Certificate],
-    certificate_chain: Vec<rustls::Certificate>,
-    private_key: rustls::PrivateKey,
+    extra_certificates: &[CertificateDer<'static>],
+    certificate_chain: Vec<rustls::pki_types::CertificateDer<'static>>,
+    private_key: rustls::pki_types::PrivateKeyDer<'static>,
 ) -> Result<tokio_rustls::TlsConnector, KeyExchangeError> {
     let mut roots = rustls::RootCertStore::empty();
     for cert in rustls_native_certs::load_native_certs()? {
-        let cert = rustls::Certificate(cert.0);
-        roots.add(&cert).map_err(KeyExchangeError::Certificate)?;
-    }
-
-    for cert in extra_certificates {
         roots.add(cert).map_err(KeyExchangeError::Certificate)?;
     }
 
-    let config = rustls::ClientConfig::builder()
-        .with_safe_defaults()
+    for cert in extra_certificates {
+        roots
+            .add(cert.clone())
+            .map_err(KeyExchangeError::Certificate)?;
+    }
+
+    let config = rustls::ClientConfig::builder_with_protocol_versions(&[&TLS13])
         .with_root_certificates(roots)
         .with_client_auth_cert(certificate_chain, private_key)
         .unwrap();
@@ -568,22 +562,4 @@ async fn supported_algorithms_request(
             ControlFlow::Break(result) => break result,
         };
     }
-}
-
-fn private_key_from_bufread(
-    mut reader: impl BufRead,
-) -> std::io::Result<Option<rustls::PrivateKey>> {
-    use rustls_pemfile::Item;
-
-    loop {
-        match rustls_pemfile::read_one(&mut reader)? {
-            Some(Item::RSAKey(key)) => return Ok(Some(rustls::PrivateKey(key))),
-            Some(Item::PKCS8Key(key)) => return Ok(Some(rustls::PrivateKey(key))),
-            Some(Item::ECKey(key)) => return Ok(Some(rustls::PrivateKey(key))),
-            None => break,
-            _ => {}
-        }
-    }
-
-    Ok(None)
 }

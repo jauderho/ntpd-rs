@@ -1,15 +1,18 @@
 use std::{
+    fmt::Display,
     io::{Read, Write},
     ops::ControlFlow,
     sync::Arc,
 };
 
+use rustls::pki_types::ServerName;
+
 use crate::{
     cookiestash::CookieStash,
+    io::{NonBlockingRead, NonBlockingWrite},
     keyset::{DecodedServerCookie, KeySet},
-    packet::AesSivCmac512,
-    packet::{AesSivCmac256, Cipher},
-    peer::{PeerNtsData, ProtocolVersion},
+    packet::{AesSivCmac256, AesSivCmac512, Cipher},
+    source::{ProtocolVersion, SourceNtsData},
 };
 
 #[derive(Debug)]
@@ -172,25 +175,28 @@ pub enum NtsRecord {
     },
 }
 
-fn read_u16_be(reader: &mut impl Read) -> std::io::Result<u16> {
+fn read_u16_be(reader: &mut impl NonBlockingRead) -> std::io::Result<u16> {
     let mut bytes = [0, 0];
     reader.read_exact(&mut bytes)?;
 
     Ok(u16::from_be_bytes(bytes))
 }
 
-fn read_u16s_be(reader: &mut impl Read, length: usize) -> std::io::Result<Vec<u16>> {
+fn read_u16s_be(reader: &mut impl NonBlockingRead, length: usize) -> std::io::Result<Vec<u16>> {
     (0..length).map(|_| read_u16_be(reader)).collect()
 }
 
 #[cfg(feature = "nts-pool")]
-fn read_u16_tuples_be(reader: &mut impl Read, length: usize) -> std::io::Result<Vec<(u16, u16)>> {
+fn read_u16_tuples_be(
+    reader: &mut impl NonBlockingRead,
+    length: usize,
+) -> std::io::Result<Vec<(u16, u16)>> {
     (0..length)
         .map(|_| Ok((read_u16_be(reader)?, read_u16_be(reader)?)))
         .collect()
 }
 
-fn read_bytes_exact(reader: &mut impl Read, length: usize) -> std::io::Result<Vec<u8>> {
+fn read_bytes_exact(reader: &mut impl NonBlockingRead, length: usize) -> std::io::Result<Vec<u8>> {
     let mut output = vec![0; length];
     reader.read_exact(&mut output)?;
 
@@ -340,7 +346,7 @@ impl NtsRecord {
         response.into_boxed_slice()
     }
 
-    pub fn read<A: Read>(reader: &mut A) -> std::io::Result<NtsRecord> {
+    pub fn read(reader: &mut impl NonBlockingRead) -> std::io::Result<NtsRecord> {
         let raw_record_type = read_u16_be(reader)?;
         let critical = raw_record_type & 0x8000 != 0;
         let record_type = raw_record_type & !0x8000;
@@ -433,7 +439,7 @@ impl NtsRecord {
         })
     }
 
-    pub fn write<A: Write>(&self, writer: &mut A) -> std::io::Result<()> {
+    pub fn write(&self, mut writer: impl NonBlockingWrite) -> std::io::Result<()> {
         // error out early when the record is invalid
         if let Err(e) = self.validate() {
             return Err(std::io::Error::new(std::io::ErrorKind::Other, e));
@@ -637,37 +643,74 @@ impl NtsRecordDecoder {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug)]
 pub enum KeyExchangeError {
-    #[error("Unrecognized record is marked as critical")]
     UnrecognizedCriticalRecord,
-    #[error("Remote: Bad request")]
     BadRequest,
-    #[error("Remote: Internal server error")]
     InternalServerError,
-    #[error("Remote: Error with unknown code {0}")]
     UnknownErrorCode(u16),
-    #[error("The server response is invalid")]
     BadResponse,
-    #[error("No continuation protocol supported by both us and server")]
     NoValidProtocol,
-    #[error("No encryption algorithm supported by both us and server")]
     NoValidAlgorithm,
-    #[error("The length of a fixed key does not match the algorithm used")]
     InvalidFixedKeyLength,
-    #[error("Missing cookies")]
     NoCookies,
-    #[error("{0}")]
-    Io(#[from] std::io::Error),
-    #[error("{0}")]
-    Tls(#[from] rustls::Error),
-    #[error("{0}")]
+    Io(std::io::Error),
+    Tls(rustls::Error),
     Certificate(rustls::Error),
-    #[error("{0}")]
-    DnsName(#[from] rustls::client::InvalidDnsNameError),
-    #[error("Incomplete response")]
+    DnsName(rustls::pki_types::InvalidDnsNameError),
     IncompleteResponse,
 }
+
+impl Display for KeyExchangeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnrecognizedCriticalRecord => {
+                write!(f, "Unrecognized record is marked as critical")
+            }
+            Self::BadRequest => write!(f, "Remote: Bad request"),
+            Self::InternalServerError => write!(f, "Remote: Internal server error"),
+            Self::UnknownErrorCode(e) => write!(f, "Remote: Error with unknown code {e}"),
+            Self::BadResponse => write!(f, "The server response is invalid"),
+            Self::NoValidProtocol => write!(
+                f,
+                "No continuation protocol supported by both us and server"
+            ),
+            Self::NoValidAlgorithm => {
+                write!(f, "No encryption algorithm supported by both us and server")
+            }
+            Self::InvalidFixedKeyLength => write!(
+                f,
+                "The length of a fixed key does not match the algorithm used"
+            ),
+            Self::NoCookies => write!(f, "Missing cookies"),
+            Self::Io(e) => write!(f, "{e}"),
+            Self::Tls(e) => write!(f, "{e}"),
+            Self::Certificate(e) => write!(f, "{e}"),
+            Self::DnsName(e) => write!(f, "{e}"),
+            Self::IncompleteResponse => write!(f, "Incomplete response"),
+        }
+    }
+}
+
+impl From<std::io::Error> for KeyExchangeError {
+    fn from(value: std::io::Error) -> Self {
+        Self::Io(value)
+    }
+}
+
+impl From<rustls::Error> for KeyExchangeError {
+    fn from(value: rustls::Error) -> Self {
+        Self::Tls(value)
+    }
+}
+
+impl From<rustls::pki_types::InvalidDnsNameError> for KeyExchangeError {
+    fn from(value: rustls::pki_types::InvalidDnsNameError) -> Self {
+        Self::DnsName(value)
+    }
+}
+
+impl std::error::Error for KeyExchangeError {}
 
 impl KeyExchangeError {
     pub(crate) fn from_error_code(error_code: u16) -> Self {
@@ -1084,7 +1127,7 @@ impl KeyExchangeResultDecoder {
 pub struct KeyExchangeResult {
     pub remote: String,
     pub port: u16,
-    pub nts: Box<PeerNtsData>,
+    pub nts: Box<SourceNtsData>,
     pub protocol_version: ProtocolVersion,
 
     #[cfg(feature = "nts-pool")]
@@ -1142,7 +1185,7 @@ impl KeyExchangeClient {
                                 Err(e) => return ControlFlow::Break(Err(KeyExchangeError::Tls(e))),
                             };
 
-                            let nts = Box::new(PeerNtsData {
+                            let nts = Box::new(SourceNtsData {
                                 cookies: result.cookies,
                                 c2s: keys.c2s,
                                 s2c: keys.s2c,
@@ -1184,7 +1227,7 @@ impl KeyExchangeClient {
         // TLS only works when the server name is a DNS name; an IP address does not work
         let tls_connection = rustls::ClientConnection::new(
             Arc::new(tls_config),
-            (server_name.as_ref() as &str).try_into()?,
+            ServerName::try_from(&server_name as &str)?.to_owned(),
         )?;
 
         Ok(KeyExchangeClient {
@@ -1480,12 +1523,13 @@ pub struct KeyExchangeServer {
     ntp_port: Option<u16>,
     ntp_server: Option<String>,
     #[cfg(feature = "nts-pool")]
-    pool_certificates: Arc<[rustls::Certificate]>,
+    pool_certificates: Arc<[rustls::pki_types::CertificateDer<'static>]>,
 }
 
 #[derive(Debug)]
 enum State {
     Active { decoder: KeyExchangeServerDecoder },
+    PendingError { error: KeyExchangeError },
     Done,
 }
 
@@ -1521,7 +1565,7 @@ impl KeyExchangeServer {
         Ok(())
     }
 
-    fn send_error_record(mut tls_connection: rustls::ServerConnection, error: &KeyExchangeError) {
+    fn send_error_record(tls_connection: &mut rustls::ServerConnection, error: &KeyExchangeError) {
         let error_records = [
             NtsRecord::Error {
                 errorcode: error.to_error_code(),
@@ -1532,7 +1576,7 @@ impl KeyExchangeServer {
             NtsRecord::EndOfMessage,
         ];
 
-        if let Err(io) = Self::send_records(&mut tls_connection, &error_records) {
+        if let Err(io) = Self::send_records(tls_connection, &error_records) {
             tracing::debug!(key_exchange_error = ?error, io_error = ?io, "sending error record failed");
         }
     }
@@ -1546,64 +1590,65 @@ impl KeyExchangeServer {
         }
 
         let mut buf = [0; 512];
-        match self.tls_connection.reader().read(&mut buf) {
-            Ok(0) => {
-                // the connection was closed cleanly by the client
-                // see https://docs.rs/rustls/latest/rustls/struct.Reader.html#method.read
-                ControlFlow::Break(self.end_of_file())
-            }
-            Ok(n) => {
-                match self.state {
-                    State::Active { decoder } => match decoder.step_with_slice(&buf[..n]) {
-                        ControlFlow::Continue(decoder) => {
-                            // more bytes are needed
-                            self.state = State::Active { decoder };
-
-                            // recursively invoke the progress function. This is very unlikely!
-                            //
-                            // Normally, all records are written with a single write call, and
-                            // received as one unit. Using many write calls does not really make
-                            // sense for a client.
-                            //
-                            // So then, the other reason we could end up here is if the buffer is
-                            // full. But 512 bytes is a lot of space for this interaction, and
-                            // should be sufficient in most cases.
-                            ControlFlow::Continue(self)
-                        }
-                        ControlFlow::Break(Ok(data)) => {
-                            // all records have been decoded; send a response
-                            // continues for a clean shutdown of the connection by the client
-                            self.state = State::Done;
-                            self.decoder_done(data)
-                        }
-                        ControlFlow::Break(Err(error)) => {
-                            Self::send_error_record(self.tls_connection, &error);
-                            ControlFlow::Break(Err(error))
-                        }
-                    },
-                    State::Done => {
-                        // client is sending more bytes, but we don't expect any more
-                        // these extra bytes are ignored
-                        ControlFlow::Continue(self)
+        loop {
+            match self.tls_connection.reader().read(&mut buf) {
+                Ok(0) => {
+                    // the connection was closed cleanly by the client
+                    // see https://docs.rs/rustls/latest/rustls/struct.Reader.html#method.read
+                    if self.wants_write() {
+                        return ControlFlow::Continue(self);
+                    } else {
+                        return ControlFlow::Break(self.end_of_file());
                     }
                 }
+                Ok(n) => {
+                    match self.state {
+                        State::Active { decoder } => match decoder.step_with_slice(&buf[..n]) {
+                            ControlFlow::Continue(decoder) => {
+                                // more bytes are needed
+                                self.state = State::Active { decoder };
+                            }
+                            ControlFlow::Break(Ok(data)) => {
+                                // all records have been decoded; send a response
+                                // continues for a clean shutdown of the connection by the client
+                                self.state = State::Done;
+                                return self.decoder_done(data);
+                            }
+                            ControlFlow::Break(Err(error)) => {
+                                Self::send_error_record(&mut self.tls_connection, &error);
+                                self.state = State::PendingError { error };
+                                return ControlFlow::Continue(self);
+                            }
+                        },
+                        State::PendingError { .. } | State::Done => {
+                            // client is sending more bytes, but we don't expect any more
+                            // these extra bytes are ignored
+                            return ControlFlow::Continue(self);
+                        }
+                    }
+                }
+                Err(e) => match e.kind() {
+                    std::io::ErrorKind::WouldBlock => {
+                        // basically an await; give other tasks a chance
+                        return ControlFlow::Continue(self);
+                    }
+                    std::io::ErrorKind::UnexpectedEof => {
+                        // the connection was closed uncleanly by the client
+                        // see https://docs.rs/rustls/latest/rustls/struct.Reader.html#method.read
+                        if self.wants_write() {
+                            return ControlFlow::Continue(self);
+                        } else {
+                            return ControlFlow::Break(self.end_of_file());
+                        }
+                    }
+                    _ => {
+                        let error = KeyExchangeError::Io(e);
+                        Self::send_error_record(&mut self.tls_connection, &error);
+                        self.state = State::PendingError { error };
+                        return ControlFlow::Continue(self);
+                    }
+                },
             }
-            Err(e) => match e.kind() {
-                std::io::ErrorKind::WouldBlock => {
-                    // basically an await; give other tasks a chance
-                    ControlFlow::Continue(self)
-                }
-                std::io::ErrorKind::UnexpectedEof => {
-                    // the connection was closed uncleanly by the client
-                    // see https://docs.rs/rustls/latest/rustls/struct.Reader.html#method.read
-                    ControlFlow::Break(self.end_of_file())
-                }
-                _ => {
-                    let error = KeyExchangeError::Io(e);
-                    Self::send_error_record(self.tls_connection, &error);
-                    ControlFlow::Break(Err(error))
-                }
-            },
         }
     }
 
@@ -1612,6 +1657,10 @@ impl KeyExchangeServer {
             State::Active { .. } => {
                 // there are no more client bytes, but decoding was not finished yet
                 Err(KeyExchangeError::IncompleteResponse)
+            }
+            State::PendingError { error } => {
+                // We can now return the error
+                Err(error)
             }
             State::Done => {
                 // we're all done
@@ -1693,8 +1742,11 @@ impl KeyExchangeServer {
                 }
             }
             Err(key_extract_error) => {
-                Self::send_error_record(self.tls_connection, &key_extract_error);
-                ControlFlow::Break(Err(key_extract_error))
+                Self::send_error_record(&mut self.tls_connection, &key_extract_error);
+                self.state = State::PendingError {
+                    error: key_extract_error,
+                };
+                ControlFlow::Continue(self)
             }
         }
     }
@@ -1704,7 +1756,7 @@ impl KeyExchangeServer {
         keyset: Arc<KeySet>,
         ntp_port: Option<u16>,
         ntp_server: Option<String>,
-        pool_certificates: Arc<[rustls::Certificate]>,
+        pool_certificates: Arc<[rustls::pki_types::CertificateDer<'static>]>,
     ) -> Result<Self, KeyExchangeError> {
         // Ensure we send only ntske/1 as alpn
         debug_assert_eq!(tls_config.alpn_protocols, &[b"ntske/1".to_vec()]);
@@ -2762,38 +2814,30 @@ mod test {
 
     #[test]
     fn test_keyexchange_client() {
-        let cert_chain: Vec<rustls::Certificate> = rustls_pemfile::certs(
+        let cert_chain: Vec<rustls::pki_types::CertificateDer> = rustls_pemfile::certs(
             &mut std::io::BufReader::new(include_bytes!("../test-keys/end.fullchain.pem") as &[u8]),
         )
-        .unwrap()
-        .into_iter()
-        .map(rustls::Certificate)
+        .map(|res| res.unwrap())
         .collect();
-        let key_der = rustls::PrivateKey(
-            rustls_pemfile::pkcs8_private_keys(&mut std::io::BufReader::new(include_bytes!(
-                "../test-keys/end.key"
-            )
-                as &[u8]))
-            .unwrap()
-            .into_iter()
-            .next()
-            .unwrap(),
-        );
+        let key_der = rustls_pemfile::pkcs8_private_keys(&mut std::io::BufReader::new(
+            include_bytes!("../test-keys/end.key") as &[u8],
+        ))
+        .map(|res| res.unwrap())
+        .next()
+        .unwrap();
         let serverconfig = rustls::ServerConfig::builder()
-            .with_safe_defaults()
             .with_no_client_auth()
-            .with_single_cert(cert_chain, key_der)
+            .with_single_cert(cert_chain, key_der.into())
             .unwrap();
         let mut root_store = rustls::RootCertStore::empty();
         root_store.add_parsable_certificates(
-            &rustls_pemfile::certs(&mut std::io::BufReader::new(include_bytes!(
+            rustls_pemfile::certs(&mut std::io::BufReader::new(include_bytes!(
                 "../test-keys/testca.pem"
             ) as &[u8]))
-            .unwrap(),
+            .map(|res| res.unwrap()),
         );
 
         let clientconfig = rustls::ClientConfig::builder()
-            .with_safe_defaults()
             .with_root_certificates(root_store)
             .with_no_client_auth();
 
@@ -2840,40 +2884,37 @@ mod test {
     }
 
     fn client_server_pair(client_type: ClientType) -> (KeyExchangeClient, KeyExchangeServer) {
-        let cert_chain: Vec<rustls::Certificate> = rustls_pemfile::certs(
+        let cert_chain: Vec<rustls::pki_types::CertificateDer> = rustls_pemfile::certs(
             &mut std::io::BufReader::new(include_bytes!("../test-keys/end.fullchain.pem") as &[u8]),
         )
-        .unwrap()
-        .into_iter()
-        .map(rustls::Certificate)
+        .map(|res| res.unwrap())
         .collect();
-        let key_der = rustls::PrivateKey(
-            rustls_pemfile::pkcs8_private_keys(&mut std::io::BufReader::new(include_bytes!(
-                "../test-keys/end.key"
-            )
-                as &[u8]))
-            .unwrap()
-            .into_iter()
-            .next()
-            .unwrap(),
-        );
+        let key_der = rustls_pemfile::pkcs8_private_keys(&mut std::io::BufReader::new(
+            include_bytes!("../test-keys/end.key") as &[u8],
+        ))
+        .map(|res| res.unwrap())
+        .next()
+        .unwrap();
         let mut root_store = rustls::RootCertStore::empty();
         root_store.add_parsable_certificates(
-            &rustls_pemfile::certs(&mut std::io::BufReader::new(include_bytes!(
+            rustls_pemfile::certs(&mut std::io::BufReader::new(include_bytes!(
                 "../test-keys/testca.pem"
             ) as &[u8]))
-            .unwrap(),
+            .map(|res| res.unwrap()),
         );
 
         let mut serverconfig = rustls::ServerConfig::builder()
-            .with_safe_defaults()
             .with_client_cert_verifier(Arc::new(
                 #[cfg(not(feature = "nts-pool"))]
                 rustls::server::NoClientAuth,
                 #[cfg(feature = "nts-pool")]
-                crate::tls_utils::AllowAnyAnonymousOrCertificateBearingClient,
+                crate::tls_utils::AllowAnyAnonymousOrCertificateBearingClient::new(
+                    // We know that our previous call to ServerConfig::builder already
+                    // installed a default provider, but this is undocumented
+                    rustls::crypto::CryptoProvider::get_default().unwrap(),
+                ),
             ))
-            .with_single_cert(cert_chain.clone(), key_der.clone())
+            .with_single_cert(cert_chain.clone(), key_der.clone_key().into())
             .unwrap();
 
         serverconfig.alpn_protocols.clear();
@@ -2881,24 +2922,20 @@ mod test {
 
         let clientconfig = match client_type {
             ClientType::Uncertified => rustls::ClientConfig::builder()
-                .with_safe_defaults()
                 .with_root_certificates(root_store)
                 .with_no_client_auth(),
             ClientType::Certified => rustls::ClientConfig::builder()
-                .with_safe_defaults()
                 .with_root_certificates(root_store)
-                .with_client_auth_cert(cert_chain, key_der)
+                .with_client_auth_cert(cert_chain, key_der.into())
                 .unwrap(),
         };
 
         let keyset = KeySetProvider::new(8).get();
 
-        let pool_cert: Vec<rustls::Certificate> = rustls_pemfile::certs(
+        let pool_cert: Vec<rustls::pki_types::CertificateDer> = rustls_pemfile::certs(
             &mut std::io::BufReader::new(include_bytes!("../test-keys/end.pem") as &[u8]),
         )
-        .unwrap()
-        .into_iter()
-        .map(rustls::Certificate)
+        .map(|res| res.unwrap())
         .collect();
         assert!(pool_cert.len() == 1);
 

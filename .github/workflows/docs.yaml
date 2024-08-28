@@ -20,13 +20,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout sources
-        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11
+        uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332
 
       - name: Build site
         run: utils/mkdocs.sh --no-bind-port build
 
       - name: Upload artifact
-        uses: actions/upload-pages-artifact@0252fc4ba7626f0298f0cf00902a25c6afc77fa8
+        uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa
         with:
           path: target/docs/site
 

@@ -1,21 +1,27 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
+use std::time::Duration;
+use std::{fmt::Debug, hash::Hash};
 
 #[cfg(feature = "ntpv5")]
 use crate::packet::v5::server_reference_id::{BloomFilter, ServerId};
-#[cfg(feature = "ntpv5")]
-use crate::peer::ProtocolVersion;
+use crate::source::NtpSourceUpdate;
 use crate::{
-    config::SynchronizationConfig,
+    algorithm::{StateUpdate, TimeSyncController},
+    clock::NtpClock,
+    config::{SourceDefaultsConfig, SynchronizationConfig},
     identifiers::ReferenceId,
     packet::NtpLeapIndicator,
-    peer::PeerSnapshot,
-    time_types::{NtpDuration, PollInterval},
+    source::{
+        NtpSource, NtpSourceActionIterator, NtpSourceSnapshot, ProtocolVersion, SourceNtsData,
+    },
+    time_types::NtpDuration,
 };
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TimeSnapshot {
-    /// Desired poll interval
-    pub poll_interval: PollInterval,
     /// Precision of the local clock
     pub precision: NtpDuration,
     /// Current root delay
@@ -31,7 +37,6 @@ pub struct TimeSnapshot {
 impl Default for TimeSnapshot {
     fn default() -> Self {
         Self {
-            poll_interval: PollInterval::default(),
             precision: NtpDuration::from_exponent(-18),
             root_delay: NtpDuration::ZERO,
             root_dispersion: NtpDuration::ZERO,
@@ -69,21 +74,21 @@ impl SystemSnapshot {
         self.accumulated_steps_threshold = config.accumulated_step_panic_threshold;
     }
 
-    pub fn update_used_peers(&mut self, used_peers: impl Iterator<Item = PeerSnapshot>) {
-        let mut used_peers = used_peers.peekable();
-        if let Some(system_peer_snapshot) = used_peers.peek() {
-            self.stratum = system_peer_snapshot.stratum.saturating_add(1);
-            self.reference_id = system_peer_snapshot.source_id;
+    pub fn update_used_sources(&mut self, used_sources: impl Iterator<Item = NtpSourceSnapshot>) {
+        let mut used_sources = used_sources.peekable();
+        if let Some(system_source_snapshot) = used_sources.peek() {
+            self.stratum = system_source_snapshot.stratum.saturating_add(1);
+            self.reference_id = system_source_snapshot.source_id;
         }
 
         #[cfg(feature = "ntpv5")]
         {
             self.bloom_filter = BloomFilter::new();
-            for peer in used_peers {
-                if let Some(bf) = &peer.bloom_filter {
+            for source in used_sources {
+                if let Some(bf) = &source.bloom_filter {
                     self.bloom_filter.add(bf);
-                } else if let ProtocolVersion::V5 = peer.protocol_version {
-                    tracing::warn!("Using NTPv5 peer without a bloom filter!");
+                } else if let ProtocolVersion::V5 = source.protocol_version {
+                    tracing::warn!("Using NTPv5 source without a bloom filter!");
                 }
             }
             self.bloom_filter.add_id(&self.server_id);
@@ -106,35 +111,288 @@ impl Default for SystemSnapshot {
     }
 }
 
+pub struct SystemSourceUpdate<ControllerMessage> {
+    pub(crate) message: ControllerMessage,
+}
+
+impl<ControllerMessage: Debug> std::fmt::Debug for SystemSourceUpdate<ControllerMessage> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SystemSourceUpdate")
+            .field("message", &self.message)
+            .finish()
+    }
+}
+
+impl<ControllerMessage: Clone> Clone for SystemSourceUpdate<ControllerMessage> {
+    fn clone(&self) -> Self {
+        Self {
+            message: self.message.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
+pub enum SystemAction<ControllerMessage> {
+    UpdateSources(SystemSourceUpdate<ControllerMessage>),
+    SetTimer(Duration),
+}
+
+#[derive(Debug)]
+pub struct SystemActionIterator<ControllerMessage> {
+    iter: <Vec<SystemAction<ControllerMessage>> as IntoIterator>::IntoIter,
+}
+
+impl<ControllerMessage> Default for SystemActionIterator<ControllerMessage> {
+    fn default() -> Self {
+        Self {
+            iter: vec![].into_iter(),
+        }
+    }
+}
+
+impl<ControllerMessage> From<Vec<SystemAction<ControllerMessage>>>
+    for SystemActionIterator<ControllerMessage>
+{
+    fn from(value: Vec<SystemAction<ControllerMessage>>) -> Self {
+        Self {
+            iter: value.into_iter(),
+        }
+    }
+}
+
+impl<ControllerMessage> Iterator for SystemActionIterator<ControllerMessage> {
+    type Item = SystemAction<ControllerMessage>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.iter.next()
+    }
+}
+
+macro_rules! actions {
+    [$($action:expr),*] => {
+        {
+            SystemActionIterator::from(vec![$($action),*])
+        }
+    }
+}
+
+pub struct System<SourceId, Controller> {
+    synchronization_config: SynchronizationConfig,
+    source_defaults_config: SourceDefaultsConfig,
+    system: SystemSnapshot,
+    ip_list: Arc<[IpAddr]>,
+
+    sources: HashMap<SourceId, Option<NtpSourceSnapshot>>,
+
+    controller: Controller,
+    controller_took_control: bool,
+}
+
+impl<SourceId: Hash + Eq + Copy + Debug, Controller: TimeSyncController<SourceId = SourceId>>
+    System<SourceId, Controller>
+{
+    pub fn new(
+        clock: Controller::Clock,
+        synchronization_config: SynchronizationConfig,
+        source_defaults_config: SourceDefaultsConfig,
+        algorithm_config: Controller::AlgorithmConfig,
+        ip_list: Arc<[IpAddr]>,
+    ) -> Result<Self, <Controller::Clock as NtpClock>::Error> {
+        // Setup system snapshot
+        let mut system = SystemSnapshot {
+            stratum: synchronization_config.local_stratum,
+            ..Default::default()
+        };
+
+        if synchronization_config.local_stratum == 1 {
+            // We are a stratum 1 server so mark our selves synchronized.
+            system.time_snapshot.leap_indicator = NtpLeapIndicator::NoWarning;
+        }
+
+        Ok(System {
+            synchronization_config,
+            source_defaults_config,
+            system,
+            ip_list,
+            sources: Default::default(),
+            controller: Controller::new(
+                clock,
+                synchronization_config,
+                source_defaults_config,
+                algorithm_config,
+            )?,
+            controller_took_control: false,
+        })
+    }
+
+    pub fn system_snapshot(&self) -> SystemSnapshot {
+        self.system
+    }
+
+    pub fn check_clock_access(&mut self) -> Result<(), <Controller::Clock as NtpClock>::Error> {
+        self.ensure_controller_control()
+    }
+
+    fn ensure_controller_control(&mut self) -> Result<(), <Controller::Clock as NtpClock>::Error> {
+        if !self.controller_took_control {
+            self.controller.take_control()?;
+            self.controller_took_control = true;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::type_complexity)]
+    pub fn create_ntp_source(
+        &mut self,
+        id: SourceId,
+        source_addr: SocketAddr,
+        protocol_version: ProtocolVersion,
+    ) -> Result<
+        (
+            NtpSource<Controller::SourceController>,
+            NtpSourceActionIterator<Controller::SourceMessage>,
+        ),
+        <Controller::Clock as NtpClock>::Error,
+    > {
+        self.ensure_controller_control()?;
+        let controller = self.controller.add_source(id);
+        self.sources.insert(id, None);
+        Ok(NtpSource::new(
+            source_addr,
+            self.source_defaults_config,
+            protocol_version,
+            controller,
+        ))
+    }
+
+    #[allow(clippy::type_complexity)]
+    pub fn create_nts_source(
+        &mut self,
+        id: SourceId,
+        source_addr: SocketAddr,
+        protocol_version: ProtocolVersion,
+        nts: Box<SourceNtsData>,
+    ) -> Result<
+        (
+            NtpSource<Controller::SourceController>,
+            NtpSourceActionIterator<Controller::SourceMessage>,
+        ),
+        <Controller::Clock as NtpClock>::Error,
+    > {
+        self.ensure_controller_control()?;
+        let controller = self.controller.add_source(id);
+        self.sources.insert(id, None);
+        Ok(NtpSource::new_nts(
+            source_addr,
+            self.source_defaults_config,
+            self.system,
+            protocol_version,
+            controller,
+            nts,
+        ))
+    }
+
+    pub fn handle_source_remove(
+        &mut self,
+        id: SourceId,
+    ) -> Result<(), <Controller::Clock as NtpClock>::Error> {
+        self.controller.remove_source(id);
+        self.sources.remove(&id);
+        Ok(())
+    }
+
+    pub fn handle_source_update(
+        &mut self,
+        id: SourceId,
+        update: NtpSourceUpdate<Controller::SourceMessage>,
+    ) -> Result<
+        SystemActionIterator<Controller::ControllerMessage>,
+        <Controller::Clock as NtpClock>::Error,
+    > {
+        let usable = update
+            .snapshot
+            .accept_synchronization(
+                self.synchronization_config.local_stratum,
+                self.ip_list.as_ref(),
+                &self.system,
+            )
+            .is_ok();
+        self.controller.source_update(id, usable);
+        *self.sources.get_mut(&id).unwrap() = Some(update.snapshot);
+        if let Some(message) = update.message {
+            let update = self.controller.source_message(id, message);
+            Ok(self.handle_algorithm_state_update(update))
+        } else {
+            Ok(actions!())
+        }
+    }
+
+    fn handle_algorithm_state_update(
+        &mut self,
+        update: StateUpdate<SourceId, Controller::ControllerMessage>,
+    ) -> SystemActionIterator<Controller::ControllerMessage> {
+        let mut actions = vec![];
+        if let Some(ref used_sources) = update.used_sources {
+            self.system
+                .update_used_sources(used_sources.iter().map(|v| {
+                    self.sources.get(v).and_then(|snapshot| *snapshot).expect(
+                    "Critical error: Source used for synchronization that is not known to system",
+                )
+                }));
+        }
+        if let Some(time_snapshot) = update.time_snapshot {
+            self.system
+                .update_timedata(time_snapshot, &self.synchronization_config);
+        }
+        if let Some(timeout) = update.next_update {
+            actions.push(SystemAction::SetTimer(timeout));
+        }
+        if let Some(message) = update.source_message {
+            actions.push(SystemAction::UpdateSources(SystemSourceUpdate { message }))
+        }
+        actions.into()
+    }
+
+    pub fn handle_timer(&mut self) -> SystemActionIterator<Controller::ControllerMessage> {
+        tracing::debug!("Timer expired");
+        let update = self.controller.time_update();
+        self.handle_algorithm_state_update(update)
+    }
+
+    pub fn update_ip_list(&mut self, ip_list: Arc<[IpAddr]>) {
+        self.ip_list = ip_list;
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::net::{Ipv4Addr, SocketAddr};
 
     use crate::time_types::PollIntervalLimits;
 
     use super::*;
 
     #[test]
-    fn test_empty_peer_update() {
+    fn test_empty_source_update() {
         let mut system = SystemSnapshot::default();
 
         // Should do nothing
-        system.update_used_peers(std::iter::empty());
+        system.update_used_sources(std::iter::empty());
 
         assert_eq!(system.stratum, 16);
         assert_eq!(system.reference_id, ReferenceId::NONE);
     }
 
     #[test]
-    fn test_peer_update() {
+    fn test_source_update() {
         let mut system = SystemSnapshot::default();
 
-        system.update_used_peers(
+        system.update_used_sources(
             vec![
-                PeerSnapshot {
+                NtpSourceSnapshot {
                     source_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
                     source_id: ReferenceId::KISS_DENY,
-                    our_id: ReferenceId::NONE,
                     poll_interval: PollIntervalLimits::default().max,
                     reach: Default::default(),
                     stratum: 2,
@@ -143,10 +401,9 @@ mod tests {
                     #[cfg(feature = "ntpv5")]
                     bloom_filter: None,
                 },
-                PeerSnapshot {
+                NtpSourceSnapshot {
                     source_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
                     source_id: ReferenceId::KISS_RATE,
-                    our_id: ReferenceId::KISS_RSTR,
                     poll_interval: PollIntervalLimits::default().max,
                     reach: Default::default(),
                     stratum: 3,

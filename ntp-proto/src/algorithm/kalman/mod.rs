@@ -1,76 +1,88 @@
-use std::{collections::HashMap, fmt::Debug, hash::Hash};
+use std::{collections::HashMap, fmt::Debug, hash::Hash, time::Duration};
 
-use tracing::{error, info, instrument};
+use tracing::{error, info};
 
 use crate::{
     clock::NtpClock,
     config::{SourceDefaultsConfig, SynchronizationConfig},
     packet::NtpLeapIndicator,
-    peer::Measurement,
     system::TimeSnapshot,
     time_types::{NtpDuration, NtpTimestamp},
 };
 
-use self::{
-    combiner::combine,
-    config::AlgorithmConfig,
-    matrix::{Matrix, Vector},
-    peer::PeerState,
-};
+use self::{combiner::combine, config::AlgorithmConfig, source::KalmanState};
 
-use super::{ObservablePeerTimedata, StateUpdate, TimeSyncController};
+use super::{ObservableSourceTimedata, StateUpdate, TimeSyncController};
 
 mod combiner;
 pub(super) mod config;
 mod matrix;
-mod peer;
 mod select;
+mod source;
+
+pub use source::KalmanSourceController;
 
 fn sqr(x: f64) -> f64 {
     x * x
 }
 
-#[derive(Debug, Clone)]
-struct PeerSnapshot<Index: Copy> {
+#[derive(Debug, Clone, Copy)]
+struct SourceSnapshot<Index: Copy> {
     index: Index,
-    state: Vector<2>,
-    uncertainty: Matrix<2, 2>,
+    state: KalmanState,
+    wander: f64,
     delay: f64,
 
-    peer_uncertainty: NtpDuration,
-    peer_delay: NtpDuration,
+    source_uncertainty: NtpDuration,
+    source_delay: NtpDuration,
     leap_indicator: NtpLeapIndicator,
 
     last_update: NtpTimestamp,
 }
 
-impl<Index: Copy> PeerSnapshot<Index> {
+impl<Index: Copy> SourceSnapshot<Index> {
     fn offset(&self) -> f64 {
-        self.state.ventry(0)
+        self.state.offset()
     }
 
     fn offset_uncertainty(&self) -> f64 {
-        self.uncertainty.entry(0, 0).sqrt()
+        self.state.offset_variance().sqrt()
     }
 
-    fn observe(&self) -> ObservablePeerTimedata {
-        ObservablePeerTimedata {
+    fn observe(&self) -> ObservableSourceTimedata {
+        ObservableSourceTimedata {
             offset: NtpDuration::from_seconds(self.offset()),
             uncertainty: NtpDuration::from_seconds(self.offset_uncertainty()),
             delay: NtpDuration::from_seconds(self.delay),
-            remote_delay: self.peer_delay,
-            remote_uncertainty: self.peer_uncertainty,
+            remote_delay: self.source_delay,
+            remote_uncertainty: self.source_uncertainty,
             last_update: self.last_update,
         }
     }
 }
 
 #[derive(Debug, Clone)]
-pub struct KalmanClockController<C: NtpClock, PeerID: Hash + Eq + Copy + Debug> {
-    peers: HashMap<PeerID, (PeerState, bool)>,
+pub struct KalmanControllerMessage {
+    inner: KalmanControllerMessageInner,
+}
+
+#[derive(Debug, Clone)]
+enum KalmanControllerMessageInner {
+    Step { steer: f64 },
+    FreqChange { steer: f64, time: NtpTimestamp },
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct KalmanSourceMessage<SourceId: Copy> {
+    inner: SourceSnapshot<SourceId>,
+}
+
+#[derive(Debug, Clone)]
+pub struct KalmanClockController<C: NtpClock, SourceId: Hash + Eq + Copy + Debug> {
+    sources: HashMap<SourceId, (Option<SourceSnapshot<SourceId>>, bool)>,
     clock: C,
     synchronization_config: SynchronizationConfig,
-    peer_defaults_config: SourceDefaultsConfig,
+    source_defaults_config: SourceDefaultsConfig,
     algo_config: AlgorithmConfig,
     freq_offset: f64,
     timedata: TimeSnapshot,
@@ -78,64 +90,68 @@ pub struct KalmanClockController<C: NtpClock, PeerID: Hash + Eq + Copy + Debug> 
     in_startup: bool,
 }
 
-impl<C: NtpClock, PeerID: Hash + Eq + Copy + Debug> KalmanClockController<C, PeerID> {
-    #[instrument(skip(self))]
-    fn update_peer(&mut self, id: PeerID, measurement: Measurement) -> bool {
-        self.peers.get_mut(&id).map(|state| {
-            state.0.update_self_using_measurement(
-                &self.peer_defaults_config,
-                &self.algo_config,
-                measurement,
-            ) && state.1
-        }) == Some(true)
-    }
-
-    fn update_clock(&mut self, time: NtpTimestamp) -> StateUpdate<PeerID> {
+impl<C: NtpClock, SourceId: Hash + Eq + Copy + Debug> KalmanClockController<C, SourceId> {
+    fn update_clock(
+        &mut self,
+        time: NtpTimestamp,
+    ) -> StateUpdate<SourceId, KalmanControllerMessage> {
         // ensure all filters represent the same (current) time
         if self
-            .peers
+            .sources
             .iter()
-            .filter_map(|(_, (state, _))| state.get_filtertime())
-            .any(|peertime| time - peertime < NtpDuration::ZERO)
+            .filter_map(|(_, (state, _))| state.map(|v| v.state.time))
+            .any(|sourcetime| time - sourcetime < NtpDuration::ZERO)
         {
             return StateUpdate {
-                used_peers: None,
+                source_message: None,
+                used_sources: None,
                 time_snapshot: Some(self.timedata),
                 next_update: None,
             };
         }
-        for (_, (state, _)) in self.peers.iter_mut() {
-            state.progress_filtertime(time);
+        for (_, (state, _)) in self.sources.iter_mut() {
+            if let Some(ref mut snapshot) = state {
+                snapshot.state = snapshot.state.progress_time(time, snapshot.wander)
+            }
         }
 
         let selection = select::select(
             &self.synchronization_config,
             &self.algo_config,
-            self.peers
+            self.sources
                 .iter()
-                .filter_map(|(index, (state, usable))| {
-                    if *usable {
-                        state.snapshot(*index)
-                    } else {
-                        None
-                    }
-                })
+                .filter_map(
+                    |(_, (state, usable))| {
+                        if *usable {
+                            state.as_ref()
+                        } else {
+                            None
+                        }
+                    },
+                )
+                .cloned()
                 .collect(),
         );
 
         if let Some(combined) = combine(&selection, &self.algo_config) {
             info!(
                 "Offset: {}+-{}ms, frequency: {}+-{}ppm",
-                combined.estimate.ventry(0) * 1e3,
-                combined.uncertainty.entry(0, 0).sqrt() * 1e3,
-                combined.estimate.ventry(1) * 1e6,
-                combined.uncertainty.entry(1, 1).sqrt() * 1e6
+                combined.estimate.offset() * 1e3,
+                combined.estimate.offset_variance().sqrt() * 1e3,
+                combined.estimate.frequency() * 1e6,
+                combined.estimate.frequency_variance().sqrt() * 1e6
             );
 
-            let freq_delta = combined.estimate.ventry(1) - self.desired_freq;
-            let freq_uncertainty = combined.uncertainty.entry(1, 1).sqrt();
-            let offset_delta = combined.estimate.ventry(0);
-            let offset_uncertainty = combined.uncertainty.entry(0, 0).sqrt();
+            if self.in_startup {
+                self.clock
+                    .disable_ntp_algorithm()
+                    .expect("Cannot update clock");
+            }
+
+            let freq_delta = combined.estimate.frequency() - self.desired_freq;
+            let freq_uncertainty = combined.estimate.frequency_variance().sqrt();
+            let offset_delta = combined.estimate.offset();
+            let offset_uncertainty = combined.estimate.offset_variance().sqrt();
             let next_update = if self.desired_freq == 0.0
                 && offset_delta.abs() > offset_uncertainty * self.algo_config.steer_offset_threshold
             {
@@ -162,15 +178,14 @@ impl<C: NtpClock, PeerID: Hash + Eq + Copy + Debug> KalmanClockController<C, Pee
                         - freq_uncertainty
                             * self.algo_config.steer_frequency_leftover
                             * freq_delta.signum(),
-                );
-                None
+                )
             } else {
-                None
+                StateUpdate::default()
             };
 
             self.timedata.root_delay = combined.delay;
             self.timedata.root_dispersion =
-                NtpDuration::from_seconds(combined.uncertainty.entry(0, 0).sqrt());
+                NtpDuration::from_seconds(combined.estimate.offset_variance().sqrt());
             self.clock
                 .error_estimate_update(self.timedata.root_dispersion, self.timedata.root_delay)
                 .expect("Cannot update clock");
@@ -184,16 +199,15 @@ impl<C: NtpClock, PeerID: Hash + Eq + Copy + Debug> KalmanClockController<C, Pee
             self.in_startup = false;
 
             StateUpdate {
-                used_peers: Some(combined.peers),
+                used_sources: Some(combined.sources),
                 time_snapshot: Some(self.timedata),
-                next_update,
+                ..next_update
             }
         } else {
             info!("No consensus cluster found");
             StateUpdate {
-                used_peers: None,
                 time_snapshot: Some(self.timedata),
-                next_update: None,
+                ..StateUpdate::default()
             }
         }
     }
@@ -233,41 +247,60 @@ impl<C: NtpClock, PeerID: Hash + Eq + Copy + Debug> KalmanClockController<C, Pee
         }
     }
 
-    fn steer_offset(&mut self, change: f64, freq_delta: f64) -> Option<NtpTimestamp> {
+    fn steer_offset(
+        &mut self,
+        change: f64,
+        freq_delta: f64,
+    ) -> StateUpdate<SourceId, KalmanControllerMessage> {
         if change.abs() > self.algo_config.step_threshold {
             // jump
             self.check_offset_steer(change);
             self.clock
                 .step_clock(NtpDuration::from_seconds(change))
                 .expect("Cannot adjust clock");
-            for (state, _) in self.peers.values_mut() {
-                state.process_offset_steering(change);
+            for (state, _) in self.sources.values_mut() {
+                if let Some(ref mut state) = state {
+                    state.state.process_offset_steering(change);
+                }
             }
             info!("Jumped offset by {}ms", change * 1e3);
-            None
+            StateUpdate {
+                source_message: Some(KalmanControllerMessage {
+                    inner: KalmanControllerMessageInner::Step { steer: change },
+                }),
+                ..StateUpdate::default()
+            }
         } else {
             // start slew
             let freq = self
                 .algo_config
                 .slew_maximum_frequency_offset
                 .min(change.abs() / self.algo_config.slew_minimum_duration);
-            let duration = NtpDuration::from_seconds(change.abs() / freq);
+            let duration = Duration::from_secs_f64(change.abs() / freq);
             info!(
                 "Slewing by {}ms over {}s",
                 change * 1e3,
-                duration.to_seconds()
+                duration.as_secs_f64(),
             );
-            Some(self.change_desired_frequency(-freq * change.signum(), freq_delta) + duration)
+            let update = self.change_desired_frequency(-freq * change.signum(), freq_delta);
+            StateUpdate {
+                next_update: Some(duration),
+                ..update
+            }
         }
     }
 
-    fn change_desired_frequency(&mut self, new_freq: f64, freq_delta: f64) -> NtpTimestamp {
+    fn change_desired_frequency(
+        &mut self,
+        new_freq: f64,
+        freq_delta: f64,
+    ) -> StateUpdate<SourceId, KalmanControllerMessage> {
         let change = self.desired_freq - new_freq + freq_delta;
         self.desired_freq = new_freq;
         self.steer_frequency(change)
     }
 
-    fn steer_frequency(&mut self, change: f64) -> NtpTimestamp {
+    fn steer_frequency(&mut self, change: f64) -> StateUpdate<SourceId, KalmanControllerMessage> {
         let new_freq_offset = ((1.0 + self.freq_offset) * (1.0 + change) - 1.0).clamp(
             -self.algo_config.maximum_frequency_steer,
             self.algo_config.maximum_frequency_steer,
@@ -278,108 +311,101 @@ impl<C: NtpClock, PeerID: Hash + Eq + Copy + Debug> KalmanClockController<C, Pee
             .clock
             .set_frequency(self.freq_offset)
             .expect("Cannot adjust clock");
-        for (state, _) in self.peers.values_mut() {
-            state.process_frequency_steering(freq_update, actual_change);
+        for (state, _) in self.sources.values_mut() {
+            if let Some(ref mut state) = state {
+                state.state =
+                    state
+                        .state
+                        .process_frequency_steering(freq_update, actual_change, state.wander)
+            }
         }
         info!(
             "Changed frequency, current steer {}ppm, desired freq {}ppm",
             self.freq_offset * 1e6,
             self.desired_freq * 1e6,
         );
-        freq_update
-    }
-
-    fn update_desired_poll(&mut self) {
-        self.timedata.poll_interval = self
-            .peers
-            .values()
-            .map(|(state, _)| {
-                state.get_desired_poll(&self.peer_defaults_config.poll_interval_limits)
-            })
-            .min()
-            .unwrap_or(self.peer_defaults_config.poll_interval_limits.max);
+        StateUpdate {
+            source_message: Some(KalmanControllerMessage {
+                inner: KalmanControllerMessageInner::FreqChange {
+                    steer: actual_change,
+                    time: freq_update,
+                },
+            }),
+            ..StateUpdate::default()
+        }
     }
 }
 
-impl<C: NtpClock, PeerID: Hash + Eq + Copy + Debug> TimeSyncController<C, PeerID>
-    for KalmanClockController<C, PeerID>
+impl<C: NtpClock, SourceId: Hash + Eq + Copy + Debug + Send + 'static> TimeSyncController
+    for KalmanClockController<C, SourceId>
 {
+    type Clock = C;
+    type SourceId = SourceId;
     type AlgorithmConfig = AlgorithmConfig;
+    type ControllerMessage = KalmanControllerMessage;
+    type SourceMessage = KalmanSourceMessage<SourceId>;
+    type SourceController = KalmanSourceController<SourceId>;
 
     fn new(
         clock: C,
         synchronization_config: SynchronizationConfig,
-        peer_defaults_config: SourceDefaultsConfig,
+        source_defaults_config: SourceDefaultsConfig,
         algo_config: Self::AlgorithmConfig,
     ) -> Result<Self, C::Error> {
         // Setup clock
-        clock.disable_ntp_algorithm()?;
-        clock.status_update(NtpLeapIndicator::Unknown)?;
-        clock.set_frequency(0.0)?;
+        let freq_offset = clock.get_frequency()?;
 
         Ok(KalmanClockController {
-            peers: HashMap::new(),
+            sources: HashMap::new(),
             clock,
             synchronization_config,
-            peer_defaults_config,
+            source_defaults_config,
             algo_config,
-            freq_offset: 0.0,
+            freq_offset,
             desired_freq: 0.0,
             timedata: TimeSnapshot::default(),
             in_startup: true,
         })
     }
 
-    fn update_config(
-        &mut self,
-        synchronization_config: SynchronizationConfig,
-        peer_defaults_config: SourceDefaultsConfig,
-        algo_config: Self::AlgorithmConfig,
-    ) {
-        self.synchronization_config = synchronization_config;
-        self.peer_defaults_config = peer_defaults_config;
-        self.algo_config = algo_config;
+    fn take_control(&mut self) -> Result<(), <C as NtpClock>::Error> {
+        self.clock.disable_ntp_algorithm()?;
+        self.clock.status_update(NtpLeapIndicator::Unknown)?;
+        Ok(())
     }
 
-    fn peer_add(&mut self, id: PeerID) {
-        self.peers.insert(id, (PeerState::new(), false));
+    fn add_source(&mut self, id: SourceId) -> Self::SourceController {
+        self.sources.insert(id, (None, false));
+        KalmanSourceController::new(id, self.algo_config, self.source_defaults_config)
     }
 
-    fn peer_remove(&mut self, id: PeerID) {
-        self.peers.remove(&id);
+    fn remove_source(&mut self, id: SourceId) {
+        self.sources.remove(&id);
     }
 
-    fn peer_update(&mut self, id: PeerID, usable: bool) {
-        if let Some(state) = self.peers.get_mut(&id) {
+    fn source_update(&mut self, id: SourceId, usable: bool) {
+        if let Some(state) = self.sources.get_mut(&id) {
             state.1 = usable;
         }
     }
-
-    fn peer_measurement(&mut self, id: PeerID, measurement: Measurement) -> StateUpdate<PeerID> {
-        let should_update_clock = self.update_peer(id, measurement);
-        self.update_desired_poll();
-        if should_update_clock {
-            self.update_clock(measurement.localtime)
-        } else {
-            StateUpdate {
-                used_peers: None,
-                time_snapshot: Some(self.timedata),
-                next_update: None,
-            }
-        }
-    }
-
-    fn time_update(&mut self) -> StateUpdate<PeerID> {
+    fn time_update(&mut self) -> StateUpdate<SourceId, Self::ControllerMessage> {
         // End slew
-        self.change_desired_frequency(0.0, 0.0);
-        StateUpdate::default()
+        self.change_desired_frequency(0.0, 0.0)
     }
 
-    fn peer_snapshot(&self, id: PeerID) -> Option<ObservablePeerTimedata> {
-        self.peers
-            .get(&id)
-            .and_then(|v| v.0.snapshot(id))
-            .map(|v| v.observe())
+    fn source_message(
+        &mut self,
+        id: SourceId,
+        message: Self::SourceMessage,
+    ) -> StateUpdate<SourceId, Self::ControllerMessage> {
+        if let Some(source) = self.sources.get_mut(&id) {
+            let time = message.inner.last_update;
+            source.0 = Some(message.inner);
+            self.update_clock(time)
+        } else {
+            error!("Internal error: Update from non-existing source");
+            StateUpdate::default()
+        }
     }
 }
 
@@ -387,7 +413,9 @@ impl<C: NtpClock, PeerID: Hash + Eq + Copy + Debug> TimeSyncController<C, PeerID
 mod tests {
     use std::cell::RefCell;
 
+    use crate::algorithm::SourceController;
     use crate::config::StepThreshold;
+    use crate::source::Measurement;
     use crate::time_types::NtpInstant;
 
     use super::*;
@@ -408,6 +436,10 @@ mod tests {
         fn set_frequency(&self, _freq: f64) -> Result<NtpTimestamp, Self::Error> {
             *self.has_steered.borrow_mut() = true;
             Ok(self.current_time)
+        }
+
+        fn get_frequency(&self) -> Result<f64, Self::Error> {
+            Ok(0.0)
         }
 
         fn step_clock(&self, _offset: NtpDuration) -> Result<NtpTimestamp, Self::Error> {
@@ -439,14 +471,14 @@ mod tests {
             ..SynchronizationConfig::default()
         };
         let algo_config = AlgorithmConfig::default();
-        let peer_defaults_config = SourceDefaultsConfig::default();
+        let source_defaults_config = SourceDefaultsConfig::default();
         let mut algo = KalmanClockController::new(
             TestClock {
                 has_steered: RefCell::new(false),
                 current_time: NtpTimestamp::from_fixed_int(0),
             },
             synchronization_config,
-            peer_defaults_config,
+            source_defaults_config,
             algo_config,
         )
         .unwrap();
@@ -455,8 +487,8 @@ mod tests {
         // ignore startup steer of frequency.
         *algo.clock.has_steered.borrow_mut() = false;
 
-        algo.peer_add(0);
-        algo.peer_update(0, true);
+        let mut source = algo.add_source(0);
+        algo.source_update(0, true);
 
         assert!(algo.in_startup);
 
@@ -466,23 +498,27 @@ mod tests {
             cur_instant = cur_instant + std::time::Duration::from_secs(1);
             algo.clock.current_time += NtpDuration::from_seconds(1.0);
             noise += 1e-9;
-            algo.peer_measurement(
-                0,
-                Measurement {
-                    delay: NtpDuration::from_seconds(0.001 + noise),
-                    offset: NtpDuration::from_seconds(1700.0 + noise),
-                    transmit_timestamp: Default::default(),
-                    receive_timestamp: Default::default(),
-                    localtime: algo.clock.current_time,
-                    monotime: cur_instant,
 
-                    stratum: 0,
-                    root_delay: NtpDuration::default(),
-                    root_dispersion: NtpDuration::default(),
-                    leap: NtpLeapIndicator::NoWarning,
-                    precision: 0,
-                },
-            );
+            let message = source.handle_measurement(Measurement {
+                delay: NtpDuration::from_seconds(0.001 + noise),
+                offset: NtpDuration::from_seconds(1700.0 + noise),
+                transmit_timestamp: Default::default(),
+                receive_timestamp: Default::default(),
+                localtime: algo.clock.current_time,
+                monotime: cur_instant,
+
+                stratum: 0,
+                root_delay: NtpDuration::default(),
+                root_dispersion: NtpDuration::default(),
+                leap: NtpLeapIndicator::NoWarning,
+                precision: 0,
+            });
+            if let Some(message) = message {
+                let actions = algo.source_message(0, message);
+                if let Some(source_message) = actions.source_message {
+                    source.handle_message(source_message);
+                }
+            }
         }
 
         assert!(!algo.in_startup);
@@ -505,14 +541,14 @@ mod tests {
             step_threshold: 1800.0,
             ..Default::default()
         };
-        let peer_defaults_config = SourceDefaultsConfig::default();
+        let source_defaults_config = SourceDefaultsConfig::default();
         let mut algo = KalmanClockController::<_, u32>::new(
             TestClock {
                 has_steered: RefCell::new(false),
                 current_time: NtpTimestamp::from_fixed_int(0),
             },
             synchronization_config,
-            peer_defaults_config,
+            source_defaults_config,
             algo_config,
         )
         .unwrap();
@@ -535,14 +571,14 @@ mod tests {
             ..SynchronizationConfig::default()
         };
         let algo_config = AlgorithmConfig::default();
-        let peer_defaults_config = SourceDefaultsConfig::default();
+        let source_defaults_config = SourceDefaultsConfig::default();
         let mut algo = KalmanClockController::<_, u32>::new(
             TestClock {
                 has_steered: RefCell::new(false),
                 current_time: NtpTimestamp::from_fixed_int(0),
             },
             synchronization_config,
-            peer_defaults_config,
+            source_defaults_config,
             algo_config,
         )
         .unwrap();
@@ -560,14 +596,14 @@ mod tests {
             ..SynchronizationConfig::default()
         };
         let algo_config = AlgorithmConfig::default();
-        let peer_defaults_config = SourceDefaultsConfig::default();
+        let source_defaults_config = SourceDefaultsConfig::default();
         let mut algo = KalmanClockController::new(
             TestClock {
                 has_steered: RefCell::new(false),
                 current_time: NtpTimestamp::from_fixed_int(0),
             },
             synchronization_config,
-            peer_defaults_config,
+            source_defaults_config,
             algo_config,
         )
         .unwrap();
@@ -576,32 +612,36 @@ mod tests {
         // ignore startup steer of frequency.
         *algo.clock.has_steered.borrow_mut() = false;
 
-        algo.peer_add(0);
-        algo.peer_update(0, true);
+        let mut source = algo.add_source(0);
+        algo.source_update(0, true);
 
         let mut noise = 1e-9;
 
         loop {
             cur_instant = cur_instant + std::time::Duration::from_secs(1);
-            algo.clock.current_time += NtpDuration::from_seconds(1.0);
+            algo.clock.current_time += NtpDuration::from_seconds(1800.0);
             noise += 1e-9;
-            algo.peer_measurement(
-                0,
-                Measurement {
-                    delay: NtpDuration::from_seconds(0.001 + noise),
-                    offset: NtpDuration::from_seconds(1700.0 + noise),
-                    transmit_timestamp: Default::default(),
-                    receive_timestamp: Default::default(),
-                    localtime: algo.clock.current_time,
-                    monotime: cur_instant,
 
-                    stratum: 0,
-                    root_delay: NtpDuration::default(),
-                    root_dispersion: NtpDuration::default(),
-                    leap: NtpLeapIndicator::NoWarning,
-                    precision: 0,
-                },
-            );
+            let message = source.handle_measurement(Measurement {
+                delay: NtpDuration::from_seconds(0.001 + noise),
+                offset: NtpDuration::from_seconds(1700.0 + noise),
+                transmit_timestamp: Default::default(),
+                receive_timestamp: Default::default(),
+                localtime: algo.clock.current_time,
+                monotime: cur_instant,
+
+                stratum: 0,
+                root_delay: NtpDuration::default(),
+                root_dispersion: NtpDuration::default(),
+                leap: NtpLeapIndicator::NoWarning,
+                precision: 0,
+            });
+            if let Some(message) = message {
+                let actions = algo.source_message(0, message);
+                if let Some(source_message) = actions.source_message {
+                    source.handle_message(source_message);
+                }
+            }
         }
     }
 
@@ -617,14 +657,14 @@ mod tests {
             ..SynchronizationConfig::default()
         };
         let algo_config = AlgorithmConfig::default();
-        let peer_defaults_config = SourceDefaultsConfig::default();
+        let source_defaults_config = SourceDefaultsConfig::default();
         let mut algo = KalmanClockController::new(
             TestClock {
                 has_steered: RefCell::new(false),
                 current_time: NtpTimestamp::from_fixed_int(0),
             },
             synchronization_config,
-            peer_defaults_config,
+            source_defaults_config,
             algo_config,
         )
         .unwrap();
@@ -633,8 +673,8 @@ mod tests {
         // ignore startup steer of frequency.
         *algo.clock.has_steered.borrow_mut() = false;
 
-        algo.peer_add(0);
-        algo.peer_update(0, true);
+        let mut source = algo.add_source(0);
+        algo.source_update(0, true);
 
         let mut noise = 1e-9;
 
@@ -642,23 +682,27 @@ mod tests {
             cur_instant = cur_instant + std::time::Duration::from_secs(1);
             algo.clock.current_time += NtpDuration::from_seconds(1.0);
             noise *= -1.0;
-            algo.peer_measurement(
-                0,
-                Measurement {
-                    delay: NtpDuration::from_seconds(0.001 + noise),
-                    offset: NtpDuration::from_seconds(-3600.0 + noise),
-                    transmit_timestamp: Default::default(),
-                    receive_timestamp: Default::default(),
-                    localtime: algo.clock.current_time,
-                    monotime: cur_instant,
 
-                    stratum: 0,
-                    root_delay: NtpDuration::default(),
-                    root_dispersion: NtpDuration::default(),
-                    leap: NtpLeapIndicator::NoWarning,
-                    precision: 0,
-                },
-            );
+            let message = source.handle_measurement(Measurement {
+                delay: NtpDuration::from_seconds(0.001 + noise),
+                offset: NtpDuration::from_seconds(-3600.0 + noise),
+                transmit_timestamp: Default::default(),
+                receive_timestamp: Default::default(),
+                localtime: algo.clock.current_time,
+                monotime: cur_instant,
+
+                stratum: 0,
+                root_delay: NtpDuration::default(),
+                root_dispersion: NtpDuration::default(),
+                leap: NtpLeapIndicator::NoWarning,
+                precision: 0,
+            });
+            if let Some(message) = message {
+                let actions = algo.source_message(0, message);
+                if let Some(source_message) = actions.source_message {
+                    source.handle_message(source_message);
+                }
+            }
         }
     }
 }

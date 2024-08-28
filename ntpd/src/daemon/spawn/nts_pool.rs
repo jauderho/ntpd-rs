@@ -1,161 +1,129 @@
+use std::fmt::Display;
 use std::ops::Deref;
 
-use thiserror::Error;
 use tokio::sync::mpsc;
 use tracing::warn;
 
 use super::super::{
-    config::NtsPoolPeerConfig, keyexchange::key_exchange_client_with_denied_servers,
+    config::NtsPoolSourceConfig, keyexchange::key_exchange_client_with_denied_servers,
 };
 
-use super::{BasicSpawner, PeerId, PeerRemovedEvent, SpawnAction, SpawnEvent, SpawnerId};
+use super::{SourceId, SourceRemovedEvent, SpawnAction, SpawnEvent, Spawner, SpawnerId};
 
 use super::nts::resolve_addr;
 
-struct PoolPeer {
-    id: PeerId,
+struct PoolSource {
+    id: SourceId,
     remote: String,
 }
 
 pub struct NtsPoolSpawner {
-    config: NtsPoolPeerConfig,
-    network_wait_period: std::time::Duration,
+    config: NtsPoolSourceConfig,
     id: SpawnerId,
-    current_peers: Vec<PoolPeer>,
+    current_sources: Vec<PoolSource>,
 }
 
-#[derive(Error, Debug)]
+#[derive(Debug)]
 pub enum NtsPoolSpawnError {
-    #[error("Channel send error: {0}")]
-    SendError(#[from] mpsc::error::SendError<SpawnEvent>),
+    SendError(mpsc::error::SendError<SpawnEvent>),
+}
+
+impl std::error::Error for NtsPoolSpawnError {}
+
+impl Display for NtsPoolSpawnError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SendError(e) => write!(f, "Channel send error: {e}"),
+        }
+    }
+}
+
+impl From<mpsc::error::SendError<SpawnEvent>> for NtsPoolSpawnError {
+    fn from(value: mpsc::error::SendError<SpawnEvent>) -> Self {
+        Self::SendError(value)
+    }
 }
 
 impl NtsPoolSpawner {
-    pub fn new(
-        config: NtsPoolPeerConfig,
-        network_wait_period: std::time::Duration,
-    ) -> NtsPoolSpawner {
+    pub fn new(config: NtsPoolSourceConfig) -> NtsPoolSpawner {
         NtsPoolSpawner {
             config,
-            network_wait_period,
             id: Default::default(),
-            current_peers: Default::default(),
+            current_sources: Default::default(),
             //known_ips: Default::default(),
         }
     }
 
-    fn contains_peer(&self, domain: &str) -> bool {
-        self.current_peers.iter().any(|peer| peer.remote == domain)
-    }
-
-    pub async fn try_fill_pool(
-        &mut self,
-        action_tx: &mpsc::Sender<SpawnEvent>,
-    ) -> Result<(), NtsPoolSpawnError> {
-        let mut wait_period = self.network_wait_period;
-
-        // early return if there is nothing to do
-        if self.current_peers.len() >= self.config.max_peers {
-            return Ok(());
-        }
-
-        loop {
-            // Try and add peers to our pool
-            while self.current_peers.len() < self.config.max_peers {
-                match key_exchange_client_with_denied_servers(
-                    self.config.addr.server_name.clone(),
-                    self.config.addr.port,
-                    &self.config.certificate_authorities,
-                    self.current_peers.iter().map(|peer| peer.remote.clone()),
-                )
-                .await
-                {
-                    Ok(ke) if !self.contains_peer(&ke.remote) => {
-                        if let Some(address) =
-                            resolve_addr(self.network_wait_period, (ke.remote.as_str(), ke.port))
-                                .await
-                        {
-                            let id = PeerId::new();
-                            self.current_peers.push(PoolPeer {
-                                id,
-                                remote: ke.remote,
-                            });
-                            action_tx
-                                .send(SpawnEvent::new(
-                                    self.id,
-                                    SpawnAction::create(
-                                        id,
-                                        address,
-                                        self.config.addr.deref().clone(),
-                                        ke.protocol_version,
-                                        Some(ke.nts),
-                                    ),
-                                ))
-                                .await?;
-                        }
-                    }
-                    Ok(_) => {
-                        warn!("received an address from pool-ke that we already had, ignoring");
-                        break;
-                    }
-                    Err(e) => {
-                        warn!(error = ?e, "error while attempting key exchange");
-                        break;
-                    }
-                };
-            }
-
-            let wait_period_max = if cfg!(test) {
-                std::time::Duration::default()
-            } else {
-                std::time::Duration::from_secs(60)
-            };
-
-            let peers_needed = self.config.max_peers - self.current_peers.len();
-            if peers_needed > 0 {
-                if wait_period > wait_period_max {
-                    warn!(peers_needed, "could not fully fill pool, giving up");
-                    //NOTE: maybe we want to communicate this up the call chain?
-                    return Ok(());
-                } else {
-                    warn!(peers_needed, "could not fully fill pool, waiting");
-                }
-                tokio::time::sleep(wait_period).await;
-                wait_period *= 2;
-            } else {
-                return Ok(());
-            }
-        }
+    fn contains_source(&self, domain: &str) -> bool {
+        self.current_sources
+            .iter()
+            .any(|source| source.remote == domain)
     }
 }
 
 #[async_trait::async_trait]
-impl BasicSpawner for NtsPoolSpawner {
+impl Spawner for NtsPoolSpawner {
     type Error = NtsPoolSpawnError;
 
-    async fn handle_init(
+    async fn try_spawn(
         &mut self,
         action_tx: &mpsc::Sender<SpawnEvent>,
     ) -> Result<(), NtsPoolSpawnError> {
-        self.handle_idle(action_tx).await?;
+        for _ in 0..self.config.count.saturating_sub(self.current_sources.len()) {
+            match key_exchange_client_with_denied_servers(
+                self.config.addr.server_name.clone(),
+                self.config.addr.port,
+                &self.config.certificate_authorities,
+                self.current_sources
+                    .iter()
+                    .map(|source| source.remote.clone()),
+            )
+            .await
+            {
+                Ok(ke) if !self.contains_source(&ke.remote) => {
+                    if let Some(address) = resolve_addr((ke.remote.as_str(), ke.port)).await {
+                        let id = SourceId::new();
+                        self.current_sources.push(PoolSource {
+                            id,
+                            remote: ke.remote,
+                        });
+                        action_tx
+                            .send(SpawnEvent::new(
+                                self.id,
+                                SpawnAction::create(
+                                    id,
+                                    address,
+                                    self.config.addr.deref().clone(),
+                                    ke.protocol_version,
+                                    Some(ke.nts),
+                                ),
+                            ))
+                            .await?;
+                    }
+                }
+                Ok(_) => {
+                    warn!("received an address from pool-ke that we already had, ignoring");
+                    continue;
+                }
+                Err(e) => {
+                    warn!(error = ?e, "error while attempting key exchange");
+                    break;
+                }
+            };
+        }
+
         Ok(())
     }
 
-    async fn handle_idle(
-        &mut self,
-        action_tx: &mpsc::Sender<SpawnEvent>,
-    ) -> Result<(), NtsPoolSpawnError> {
-        self.try_fill_pool(action_tx).await?;
-        Ok(())
+    fn is_complete(&self) -> bool {
+        self.current_sources.len() >= self.config.count
     }
 
-    async fn handle_peer_removed(
+    async fn handle_source_removed(
         &mut self,
-        removed_peer: PeerRemovedEvent,
-        action_tx: &mpsc::Sender<SpawnEvent>,
+        removed_source: SourceRemovedEvent,
     ) -> Result<(), NtsPoolSpawnError> {
-        self.current_peers.retain(|p| p.id != removed_peer.id);
-        self.try_fill_pool(action_tx).await?;
+        self.current_sources.retain(|p| p.id != removed_source.id);
         Ok(())
     }
 
@@ -164,7 +132,7 @@ impl BasicSpawner for NtsPoolSpawner {
     }
 
     fn get_addr_description(&self) -> String {
-        format!("{} ({})", self.config.addr.deref(), self.config.max_peers)
+        format!("{} ({})", self.config.addr.deref(), self.config.count)
     }
 
     fn get_description(&self) -> &str {

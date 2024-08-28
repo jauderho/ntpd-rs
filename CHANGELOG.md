@@ -1,5 +1,48 @@
 # Changelog
 
+## [1.2.3] - 2024-07-22
+
+### Fixed
+- Metrics exporter should wait for an actual request before sending a response
+
+## [1.2.2] - 2024-07-18
+
+### Changed
+- Updated dependencies
+
+### Fixed
+- Fixed a bug in network change detection that prevented startup on FreeBSD.
+- Fixed a bug in leap second flag handling where previous flags weren't explicitly unset.
+- Fixed a bug that caused NTS-KE sessions from clients with a large request to hang.
+- Fixed a bug that caused NTS-KE error records never to be sent.
+
+## [1.2.0] - 2024-07-11
+
+### Added
+- Pool mode sources can be set up to ignore some addresses returned by the pool
+- NTP sources use a random client port for every request sent
+- The metrics exporter will keep trying to startup while its network interface is not yet available
+- Added option for server to only respond to NTS messages.
+
+### Changed
+- Updated dependencies
+- ntp-udp and ntp-os-clock were replaced by timestamped-socket and clock-steering
+- Minor improvements to NTS keyset storage errors
+- Loop detection is handled globally instead of per source
+- The MSRV was raised to 1.70
+- The metrics exporter is better able to handle multiple simultaneous connections
+- Pendulum is now part of Trifecta Tech Foundation (copyright was updated)
+- Large parts of the daemon code have been refactored to simplify the code
+
+### Fixed
+- Metrics would not synchronize if the metrics data was too large
+- ntpd-rs would ignore responses from servers implementing NTPv3
+
+## [1.1.3] - 2024-06-28
+
+### Fixed
+- Unlimited number of NTS-KE connections could crash ntpd-rs server (CVE-2024-38528)
+
 ## [1.1.2] - 2024-02-01
 
 ### Fixed
@@ -188,6 +231,10 @@ process.
 - Fixed a bug in peer dispersion calculation which resulted in overly
   pessimistic dispersion estimates.
 
+[1.2.3]: https://github.com/pendulum-project/ntpd-rs/compare/v1.2.2...v1.2.3
+[1.2.2]: https://github.com/pendulum-project/ntpd-rs/compare/v1.2.0...v1.2.2
+[1.2.0]: https://github.com/pendulum-project/ntpd-rs/compare/v1.1.3...v1.2.0
+[1.1.3]: https://github.com/pendulum-project/ntpd-rs/compare/v1.1.2...v1.1.3
 [1.1.2]: https://github.com/pendulum-project/ntpd-rs/compare/v1.1.1...v1.1.2
 [1.1.1]: https://github.com/pendulum-project/ntpd-rs/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/pendulum-project/ntpd-rs/compare/v1.0.0...v1.1.0

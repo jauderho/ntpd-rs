@@ -13,10 +13,13 @@ mod clock;
 mod config;
 mod cookiestash;
 mod identifiers;
+mod io;
+mod ipfilter;
 mod keyset;
 mod nts_record;
 mod packet;
-mod peer;
+mod server;
+mod source;
 mod system;
 mod time_types;
 
@@ -35,12 +38,15 @@ pub(crate) mod exitcode {
 
 mod exports {
     pub use super::algorithm::{
-        AlgorithmConfig, KalmanClockController, ObservablePeerTimedata, StateUpdate,
+        AlgorithmConfig, KalmanClockController, KalmanControllerMessage, KalmanSourceController,
+        KalmanSourceMessage, ObservableSourceTimedata, SourceController, StateUpdate,
         TimeSyncController,
     };
     pub use super::clock::NtpClock;
     pub use super::config::{SourceDefaultsConfig, StepThreshold, SynchronizationConfig};
     pub use super::identifiers::ReferenceId;
+    #[cfg(feature = "__internal-fuzz")]
+    pub use super::ipfilter::fuzz::fuzz_ipfilter;
     pub use super::keyset::{DecodedServerCookie, KeySet, KeySetProvider};
 
     #[cfg(feature = "__internal-fuzz")]
@@ -51,15 +57,21 @@ mod exports {
         Cipher, CipherProvider, EncryptResult, ExtensionHeaderVersion, NoCipher,
         NtpAssociationMode, NtpLeapIndicator, NtpPacket, PacketParsingError,
     };
-    #[cfg(feature = "__internal-fuzz")]
-    pub use super::peer::fuzz_measurement_from_packet;
-    #[cfg(feature = "__internal-test")]
-    pub use super::peer::peer_snapshot;
-    pub use super::peer::{
-        AcceptSynchronizationError, IgnoreReason, Measurement, Peer, PeerNtsData, PeerSnapshot,
-        PollError, ProtocolVersion, Reach, Update,
+    pub use super::server::{
+        FilterAction, FilterList, IpSubnet, Server, ServerAction, ServerConfig, ServerReason,
+        ServerResponse, ServerStatHandler, SubnetParseError,
     };
-    pub use super::system::{SystemSnapshot, TimeSnapshot};
+    #[cfg(feature = "__internal-test")]
+    pub use super::source::source_snapshot;
+    pub use super::source::{
+        AcceptSynchronizationError, Measurement, NtpSource, NtpSourceAction,
+        NtpSourceActionIterator, NtpSourceSnapshot, NtpSourceUpdate, ObservableSourceState,
+        ProtocolVersion, Reach, SourceNtsData,
+    };
+    pub use super::system::{
+        System, SystemAction, SystemActionIterator, SystemSnapshot, SystemSourceUpdate,
+        TimeSnapshot,
+    };
     #[cfg(feature = "__internal-fuzz")]
     pub use super::time_types::fuzz_duration_from_seconds;
     pub use super::time_types::{

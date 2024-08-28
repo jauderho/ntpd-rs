@@ -11,21 +11,41 @@ on:
 
 jobs:
   package:
-    uses: NLnetLabs/ploutos/.github/workflows/pkg-rust.yml@v7
-    with:
-      workspace_package: ntpd
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target:
+          - aarch64-unknown-linux-gnu
+          - armv7-unknown-linux-gnueabihf
+          - x86_64-unknown-linux-gnu
+          - i686-unknown-linux-gnu
+    steps:
+      - name: Setup packaging tools for cross compiled artifacts
+        uses: awalsh128/cache-apt-pkgs-action@a6c3917cc929dd0345bfb2d3feaf9101823370ad # v1.4.2
+        with:
+          packages: qemu-user-static crossbuild-essential-armhf crossbuild-essential-arm64 crossbuild-essential-i386
+          version: 1
 
-      package_build_rules: |
-        pkg: ntpd-rs
-        image:
-          - "rockylinux:9"
-          - "ubuntu:xenial"
-        target: x86_64
-        extra_build_args: "--features unstable_ntpv5"
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@7b1c307e0dcbda6122208f10795a713336a9b35a
+        with:
+          toolchain: "stable"
+          components: "llvm-tools"
 
-      package_test_scripts_path: pkg/test-scripts/test-ntpd-rs.sh
+      - name: Install cross, cargo-deb and cargo-generate-rpm
+        uses: taiki-e/install-action@f172798ba087526822a4f43dd08714d08a45aa37
+        with:
+          tool: cross, cargo-deb, cargo-generate-rpm@0.14.0
 
-      rpm_scriptlets_path: pkg/rpm/scriptlets.toml
+      - name: Checkout sources
+        uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332
 
-      rpm_extra_build_packages: git
-      deb_extra_build_packages: git
+      - name: Build the release binaries
+        run: RELEASE_TARGETS="${{ matrix.target }}" RELEASE_FEATURES="unstable_ntpv5" utils/build-release.sh
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@834a144ee995460fba8ed112a2fc961b36a5ec5a # v4.3.6
+        with:
+          name: release-binaries-${{ matrix.target }}
+          path: target/pkg/
+          if-no-files-found: error

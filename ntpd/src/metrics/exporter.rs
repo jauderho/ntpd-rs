@@ -1,9 +1,13 @@
-use tokio::io::AsyncWriteExt;
+use libc::{ECONNABORTED, EMFILE, ENFILE, ENOBUFS, ENOMEM};
+use timestamped_socket::interface::ChangeDetector;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tracing::{debug, error, trace, warn};
 
 use std::{
     fmt::Write,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use crate::daemon::{config::CliArg, initialize_logging_parse_config, ObservableState};
@@ -122,9 +126,10 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn run(options: NtpMetricsExporterOptions) -> Result<(), Box<dyn std::error::Error>> {
     let config = initialize_logging_parse_config(None, options.config).await;
+    let timeout = std::time::Duration::from_millis(1000);
 
     let observation_socket_path = match config.observability.observation_path {
-        Some(path) => path,
+        Some(path) => Arc::new(path),
         None => {
             eprintln!("An observation socket path must be configured using the observation-path option in the [observability] section of the configuration");
             std::process::exit(1);
@@ -136,30 +141,131 @@ async fn run(options: NtpMetricsExporterOptions) -> Result<(), Box<dyn std::erro
         &config.observability.metrics_exporter_listen
     );
 
-    let listener = TcpListener::bind(&config.observability.metrics_exporter_listen).await?;
-    let mut buf = String::with_capacity(4 * 1024);
-
-    loop {
-        let (mut tcp_stream, _) = listener.accept().await?;
-
-        buf.clear();
-        match handler(&mut buf, &observation_socket_path).await {
-            Ok(()) => {
-                tcp_stream.write_all(buf.as_bytes()).await?;
+    let listener = loop {
+        match TcpListener::bind(&config.observability.metrics_exporter_listen).await {
+            Err(e) if e.kind() == std::io::ErrorKind::AddrNotAvailable => {
+                tracing::info!("Could not open listening socket, waiting for interface to come up");
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(60),
+                    ChangeDetector::new()?.wait_for_change(),
+                )
+                .await;
             }
             Err(e) => {
-                tracing::warn!("hit an error: {e}");
+                tracing::warn!("Could not open listening socket: {}", e);
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(60),
+                    ChangeDetector::new()?.wait_for_change(),
+                )
+                .await;
+            }
+            Ok(listener) => break listener,
+        };
+    };
 
-                const ERROR_REPONSE: &str = concat!(
-                    "HTTP/1.1 500 Internal Server Error\r\n",
-                    "content-type: text/plain\r\n",
-                    "content-length: 0\r\n\r\n",
-                );
+    // this has a lot more permits than the daemon observer has, but we expect http transfers to
+    // take longer than how much time the daemon needs to return observability data
+    let permits = Arc::new(tokio::sync::Semaphore::new(100));
 
-                tcp_stream.write_all(ERROR_REPONSE.as_bytes()).await?;
+    loop {
+        let permit = permits
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("semaphore was unexpectedly closed");
+        let (mut tcp_stream, _) = match listener.accept().await {
+            Ok(a) => a,
+            Err(e) if matches!(e.raw_os_error(), Some(ECONNABORTED)) => {
+                debug!("Client unexpectedly closed connection: {e}");
+                continue;
+            }
+            Err(e)
+                if matches!(
+                    e.raw_os_error(),
+                    Some(ENFILE) | Some(EMFILE) | Some(ENOMEM) | Some(ENOBUFS)
+                ) =>
+            {
+                error!("Not enough resources available to accept incoming connection: {e}");
+                tokio::time::sleep(timeout).await;
+                continue;
+            }
+            Err(e) => {
+                error!("Could not accept incoming connection: {e}");
+                return Err(e.into());
+            }
+        };
+        let path = observation_socket_path.clone();
+
+        // handle each connection on a separate task
+        let fut = async move { handle_connection(&mut tcp_stream, &path).await };
+
+        tokio::spawn(async move {
+            match tokio::time::timeout(timeout, fut).await {
+                Err(_) => debug!("connection timed out"),
+                Ok(Err(e)) => warn!("error handling connection: {e}"),
+                Ok(_) => trace!("connection handled successfully"),
+            }
+            drop(permit);
+        });
+    }
+}
+
+async fn handle_connection(
+    stream: &mut (impl tokio::io::AsyncWrite + tokio::io::AsyncRead + Unpin),
+    observation_socket_path: &Path,
+) -> std::io::Result<()> {
+    // Wait until a request was sent, dropping the bytes read when this scope ends
+    // to ensure we don't accidentally use them afterwards
+    {
+        // Receive all data until the header was fully received, or until max buf size
+        let mut buf = [0u8; 2048];
+        let mut bytes_read = 0;
+        loop {
+            bytes_read += stream.read(&mut buf[bytes_read..]).await?;
+
+            // The headers end with two CRLFs in a row
+            if buf[0..bytes_read].windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+
+            // Headers should easily fit within the buffer
+            // If we have not found the end yet, we are not going to
+            if bytes_read >= buf.len() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Request too long",
+                ));
             }
         }
+
+        // We only respond to GET requests
+        if !buf[0..bytes_read].starts_with(b"GET ") {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Expected GET request",
+            ));
+        }
     }
+
+    // Send the response
+    let mut buf = String::with_capacity(4 * 1024);
+    match handler(&mut buf, observation_socket_path).await {
+        Ok(()) => {
+            stream.write_all(buf.as_bytes()).await?;
+        }
+        Err(e) => {
+            tracing::warn!("hit an error: {e}");
+
+            const ERROR_REPONSE: &str = concat!(
+                "HTTP/1.1 500 Internal Server Error\r\n",
+                "content-type: text/plain\r\n",
+                "content-length: 0\r\n\r\n",
+            );
+
+            stream.write_all(ERROR_REPONSE.as_bytes()).await?;
+        }
+    }
+    Ok(())
 }
 
 async fn handler(buf: &mut String, observation_socket_path: &Path) -> std::io::Result<()> {
@@ -189,7 +295,7 @@ fn format_response(buf: &mut String, state: &ObservableState) -> std::fmt::Resul
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::io::Cursor;
 
     use super::*;
 
@@ -203,5 +309,25 @@ mod tests {
 
         let options = NtpMetricsExporterOptions::try_parse_from(arguments).unwrap();
         assert_eq!(options.config.unwrap().as_path(), config);
+    }
+
+    #[tokio::test]
+    async fn deny_non_get_request() {
+        let mut example = b"POST / HTTP/1.1\r\n\r\n".to_vec();
+        let mut cursor = Cursor::new(&mut example);
+        let res = handle_connection(&mut cursor, Path::new("/tmp/ntpd-rs.sock")).await;
+        let err = res.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(err.to_string(), "Expected GET request");
+    }
+
+    #[tokio::test]
+    async fn does_not_accept_large_requests() {
+        let mut example = [1u8; 4096].to_vec();
+        let mut cursor = Cursor::new(&mut example);
+        let res = handle_connection(&mut cursor, Path::new("/tmp/ntpd-rs.sock")).await;
+        let err = res.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(err.to_string(), "Request too long");
     }
 }
