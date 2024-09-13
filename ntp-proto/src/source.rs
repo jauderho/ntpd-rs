@@ -58,7 +58,7 @@ impl std::fmt::Debug for SourceNtsData {
 pub struct NtpSource<Controller: SourceController> {
     nts: Option<Box<SourceNtsData>>,
 
-    // Poll interval used when sending last poll mesage.
+    // Poll interval used when sending last poll message.
     last_poll_interval: PollInterval,
     // The poll interval desired by the remove server.
     // Must be increased when the server sends the RATE kiss code.
@@ -419,6 +419,7 @@ pub struct ObservableSourceState<SourceId> {
     pub timedata: ObservableSourceTimedata,
     pub unanswered_polls: u32,
     pub poll_interval: PollInterval,
+    pub nts_cookies: Option<usize>,
     pub name: String,
     pub address: String,
     pub id: SourceId,
@@ -488,6 +489,7 @@ impl<Controller: SourceController> NtpSource<Controller> {
             timedata: self.controller.observe(),
             unanswered_polls: self.reach.unanswered_polls(),
             poll_interval: self.last_poll_interval,
+            nts_cookies: self.nts.as_ref().map(|nts| nts.cookies.len()),
             name,
             address: self.source_addr.to_string(),
             id,
@@ -640,7 +642,7 @@ impl<Controller: SourceController> NtpSource<Controller> {
                     info!("Server does not support NTPv5, stopping the upgrade process");
                     self.protocol_version = ProtocolVersion::V4;
                 } else {
-                    debug!(tries_left, "Server did not yet responde with upgrade code");
+                    debug!(tries_left, "Server did not yet respond with upgrade code");
                     self.protocol_version = ProtocolVersion::V4UpgradingToV5 { tries_left };
                 };
             }

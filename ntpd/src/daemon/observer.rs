@@ -196,51 +196,11 @@ mod tests {
     #[cfg(feature = "unstable_ntpv5")]
     use ntp_proto::v5::{BloomFilter, ServerId};
     use ntp_proto::{
-        NtpClock, NtpDuration, NtpLeapIndicator, NtpTimestamp, PollIntervalLimits, Reach,
-        ReferenceId, TimeSnapshot,
+        NtpDuration, NtpLeapIndicator, PollIntervalLimits, Reach, ReferenceId, TimeSnapshot,
     };
     use tokio::{io::AsyncReadExt, net::UnixStream};
 
     use super::*;
-
-    #[derive(Debug, Clone, Default)]
-    struct TestClock {}
-
-    impl NtpClock for TestClock {
-        type Error = std::io::Error;
-
-        fn now(&self) -> std::result::Result<NtpTimestamp, Self::Error> {
-            Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
-        }
-
-        fn set_frequency(&self, _freq: f64) -> Result<NtpTimestamp, Self::Error> {
-            Ok(NtpTimestamp::default())
-        }
-
-        fn get_frequency(&self) -> Result<f64, Self::Error> {
-            Ok(0.0)
-        }
-
-        fn step_clock(&self, _offset: NtpDuration) -> Result<NtpTimestamp, Self::Error> {
-            Ok(NtpTimestamp::default())
-        }
-
-        fn disable_ntp_algorithm(&self) -> Result<(), Self::Error> {
-            Ok(())
-        }
-
-        fn error_estimate_update(
-            &self,
-            _est_error: NtpDuration,
-            _max_error: NtpDuration,
-        ) -> Result<(), Self::Error> {
-            Ok(())
-        }
-
-        fn status_update(&self, _leap_status: NtpLeapIndicator) -> Result<(), Self::Error> {
-            Ok(())
-        }
-    }
 
     #[tokio::test]
     async fn test_observation() {
@@ -261,6 +221,7 @@ mod tests {
                 timedata: Default::default(),
                 unanswered_polls: Reach::default().unanswered_polls(),
                 poll_interval: PollIntervalLimits::default().min,
+                nts_cookies: None,
                 name: "127.0.0.3:123".into(),
                 address: "127.0.0.3:123".into(),
                 id,
@@ -327,6 +288,7 @@ mod tests {
                 timedata: Default::default(),
                 unanswered_polls: Reach::default().unanswered_polls(),
                 poll_interval: PollIntervalLimits::default().min,
+                nts_cookies: None,
                 name: "127.0.0.3:123".into(),
                 address: "127.0.0.3:123".into(),
                 id,
@@ -366,7 +328,7 @@ mod tests {
         let mut reader = UnixStream::connect(path).await.unwrap();
 
         // We do a small partial read of the data to test that whatever
-        // happens, the observer doesnt keep a lock alive on either of
+        // happens, the observer doesn't keep a lock alive on either of
         // of the RwLocks.
         let mut buf = [0_u8; 12];
         let mut bufref: &mut [u8] = &mut buf;
