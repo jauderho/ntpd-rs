@@ -1,6 +1,6 @@
 use std::{collections::HashMap, fmt::Debug, hash::Hash, time::Duration};
 
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 use crate::{
     clock::NtpClock,
@@ -204,7 +204,7 @@ impl<C: NtpClock, SourceId: Hash + Eq + Copy + Debug> KalmanClockController<C, S
                 ..next_update
             }
         } else {
-            info!("No consensus cluster found");
+            info!("No consensus on current time");
             StateUpdate {
                 time_snapshot: Some(self.timedata),
                 ..StateUpdate::default()
@@ -260,7 +260,7 @@ impl<C: NtpClock, SourceId: Hash + Eq + Copy + Debug> KalmanClockController<C, S
                 .expect("Cannot adjust clock");
             for (state, _) in self.sources.values_mut() {
                 if let Some(ref mut state) = state {
-                    state.state.process_offset_steering(change);
+                    state.state = state.state.process_offset_steering(change);
                 }
             }
             info!("Jumped offset by {}ms", change * 1e3);
@@ -277,7 +277,7 @@ impl<C: NtpClock, SourceId: Hash + Eq + Copy + Debug> KalmanClockController<C, S
                 .slew_maximum_frequency_offset
                 .min(change.abs() / self.algo_config.slew_minimum_duration);
             let duration = Duration::from_secs_f64(change.abs() / freq);
-            info!(
+            debug!(
                 "Slewing by {}ms over {}s",
                 change * 1e3,
                 duration.as_secs_f64(),
@@ -319,7 +319,7 @@ impl<C: NtpClock, SourceId: Hash + Eq + Copy + Debug> KalmanClockController<C, S
                         .process_frequency_steering(freq_update, actual_change, state.wander)
             }
         }
-        info!(
+        debug!(
             "Changed frequency, current steer {}ppm, desired freq {}ppm",
             self.freq_offset * 1e6,
             self.desired_freq * 1e6,
@@ -412,6 +412,8 @@ impl<C: NtpClock, SourceId: Hash + Eq + Copy + Debug + Send + 'static> TimeSyncC
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
+
+    use matrix::{Matrix, Vector};
 
     use crate::algorithm::SourceController;
     use crate::config::StepThreshold;
@@ -586,6 +588,95 @@ mod tests {
         algo.in_startup = false;
         algo.steer_offset(1000.0, 0.0);
         algo.steer_offset(-1000.0, 0.0);
+    }
+
+    #[test]
+    fn test_jumps_update_state() {
+        let synchronization_config = SynchronizationConfig::default();
+        let algo_config = AlgorithmConfig::default();
+        let source_defaults_config = SourceDefaultsConfig::default();
+        let mut algo = KalmanClockController::<_, u32>::new(
+            TestClock {
+                has_steered: RefCell::new(false),
+                current_time: NtpTimestamp::from_fixed_int(0),
+            },
+            synchronization_config,
+            source_defaults_config,
+            algo_config,
+        )
+        .unwrap();
+
+        algo.sources.insert(
+            0,
+            (
+                Some(SourceSnapshot {
+                    index: 0,
+                    state: KalmanState {
+                        state: Vector::new_vector([0.0, 0.0]),
+                        uncertainty: Matrix::new([[1e-18, 0.0], [0.0, 1e-18]]),
+                        time: NtpTimestamp::from_fixed_int(0),
+                    },
+                    wander: 0.0,
+                    delay: 0.0,
+                    source_uncertainty: NtpDuration::ZERO,
+                    source_delay: NtpDuration::ZERO,
+                    leap_indicator: NtpLeapIndicator::NoWarning,
+                    last_update: NtpTimestamp::from_fixed_int(0),
+                }),
+                true,
+            ),
+        );
+
+        algo.steer_offset(100.0, 0.0);
+        assert_eq!(
+            algo.sources.get(&0).unwrap().0.unwrap().state.offset(),
+            -100.0
+        );
+        assert_eq!(
+            algo.sources.get(&0).unwrap().0.unwrap().state.time,
+            NtpTimestamp::from_seconds_nanos_since_ntp_era(100, 0)
+        );
+    }
+
+    #[test]
+    fn test_freqsteer_update_state() {
+        let synchronization_config = SynchronizationConfig::default();
+        let algo_config = AlgorithmConfig::default();
+        let source_defaults_config = SourceDefaultsConfig::default();
+        let mut algo = KalmanClockController::<_, u32>::new(
+            TestClock {
+                has_steered: RefCell::new(false),
+                current_time: NtpTimestamp::from_fixed_int(0),
+            },
+            synchronization_config,
+            source_defaults_config,
+            algo_config,
+        )
+        .unwrap();
+
+        algo.sources.insert(
+            0,
+            (
+                Some(SourceSnapshot {
+                    index: 0,
+                    state: KalmanState {
+                        state: Vector::new_vector([0.0, 0.0]),
+                        uncertainty: Matrix::new([[1e-18, 0.0], [0.0, 1e-18]]),
+                        time: NtpTimestamp::from_fixed_int(0),
+                    },
+                    wander: 0.0,
+                    delay: 0.0,
+                    source_uncertainty: NtpDuration::ZERO,
+                    source_delay: NtpDuration::ZERO,
+                    leap_indicator: NtpLeapIndicator::NoWarning,
+                    last_update: NtpTimestamp::from_fixed_int(0),
+                }),
+                true,
+            ),
+        );
+
+        algo.steer_frequency(1e-6);
+        assert!(algo.sources.get(&0).unwrap().0.unwrap().state.frequency() - -1e-6 < 1e-12);
     }
 
     #[test]
