@@ -86,6 +86,7 @@ pub(crate) struct SockSourceTask<
     index: SourceId,
     socket: UnixDatagram,
     clock: C,
+    path: PathBuf,
     channels: SourceChannels<Controller::ControllerMessage, Controller::SourceMessage>,
     source: OneWaySource<Controller>,
 }
@@ -174,6 +175,19 @@ where
                             .send(MsgForSystem::OneWaySourceUpdate(self.index, update))
                             .await
                             .ok();
+
+                        self.channels
+                            .source_snapshots
+                            .write()
+                            .expect("Unexpected poisoned mutex")
+                            .insert(
+                                self.index,
+                                self.source.observe(
+                                    "GPSd socket".to_string(),
+                                    self.path.display().to_string(),
+                                    self.index,
+                                ),
+                            );
                     }
                     Err(e) => {
                         error!("Error deserializing sample: {}", e);
@@ -201,13 +215,14 @@ where
         channels: SourceChannels<Controller::ControllerMessage, Controller::SourceMessage>,
         source: OneWaySource<Controller>,
     ) -> tokio::task::JoinHandle<()> {
-        let socket = create_socket(socket_path).expect("Could not create socket");
+        let socket = create_socket(&socket_path).expect("Could not create socket");
         tokio::spawn(
             (async move {
                 let mut process = SockSourceTask {
                     index,
                     socket,
                     clock,
+                    path: socket_path,
                     channels,
                     source,
                 };
@@ -229,7 +244,7 @@ mod tests {
 
     use ntp_proto::{
         AlgorithmConfig, KalmanClockController, NtpClock, NtpDuration, NtpLeapIndicator,
-        NtpTimestamp, ReferenceId, SourceDefaultsConfig, SynchronizationConfig,
+        NtpTimestamp, ReferenceId, SourceConfig, SynchronizationConfig,
     };
     use tokio::sync::mpsc;
 
@@ -303,7 +318,6 @@ mod tests {
         let mut system: ntp_proto::System<_, KalmanClockController<_, _>> = ntp_proto::System::new(
             clock.clone(),
             SynchronizationConfig::default(),
-            SourceDefaultsConfig::default(),
             AlgorithmConfig::default(),
             Arc::new([]),
         )
@@ -321,7 +335,9 @@ mod tests {
                 system_update_receiver,
                 source_snapshots: Arc::new(RwLock::new(HashMap::new())),
             },
-            system.create_sock_source(index, 0.001).unwrap(),
+            system
+                .create_sock_source(index, SourceConfig::default(), 0.001)
+                .unwrap(),
         );
 
         // Send example data to socket

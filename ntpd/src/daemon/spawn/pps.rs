@@ -1,23 +1,23 @@
 use ntp_proto::SourceConfig;
 use tokio::sync::mpsc;
 
-use crate::daemon::config::SockSourceConfig;
+use crate::daemon::config::PpsSourceConfig;
 
 use super::{
-    standard::StandardSpawnError, SockSourceCreateParameters, SourceCreateParameters, SourceId,
+    standard::StandardSpawnError, PpsSourceCreateParameters, SourceCreateParameters, SourceId,
     SourceRemovalReason, SourceRemovedEvent, SpawnAction, SpawnEvent, Spawner, SpawnerId,
 };
 
-pub struct SockSpawner {
-    config: SockSourceConfig,
+pub struct PpsSpawner {
+    config: PpsSourceConfig,
     source_config: SourceConfig,
     id: SpawnerId,
     has_spawned: bool,
 }
 
-impl SockSpawner {
-    pub fn new(config: SockSourceConfig, source_config: SourceConfig) -> SockSpawner {
-        SockSpawner {
+impl PpsSpawner {
+    pub fn new(config: PpsSourceConfig, source_config: SourceConfig) -> PpsSpawner {
+        PpsSpawner {
             config,
             source_config,
             id: Default::default(),
@@ -27,7 +27,7 @@ impl SockSpawner {
 }
 
 #[async_trait::async_trait]
-impl Spawner for SockSpawner {
+impl Spawner for PpsSpawner {
     type Error = StandardSpawnError;
 
     async fn try_spawn(
@@ -37,11 +37,12 @@ impl Spawner for SockSpawner {
         action_tx
             .send(SpawnEvent::new(
                 self.id,
-                SpawnAction::Create(SourceCreateParameters::Sock(SockSourceCreateParameters {
+                SpawnAction::Create(SourceCreateParameters::Pps(PpsSourceCreateParameters {
                     id: SourceId::new(),
                     path: self.config.path.clone(),
                     config: self.source_config,
                     noise_estimate: self.config.measurement_noise_estimate,
+                    period: self.config.period,
                 })),
             ))
             .await?;
@@ -72,7 +73,7 @@ impl Spawner for SockSpawner {
     }
 
     fn get_description(&self) -> &str {
-        "sock"
+        "PPS"
     }
 }
 
@@ -83,8 +84,8 @@ mod tests {
 
     use crate::{
         daemon::{
-            config::SockSourceConfig,
-            spawn::{sock::SockSpawner, SourceCreateParameters, SpawnAction, Spawner},
+            config::PpsSourceConfig,
+            spawn::{pps::PpsSpawner, SourceCreateParameters, SpawnAction, Spawner},
             system::MESSAGE_BUFFER_SIZE,
         },
         test::alloc_port,
@@ -94,10 +95,11 @@ mod tests {
     async fn creates_a_source() {
         let socket_path = std::env::temp_dir().join(format!("ntp-test-stream-{}", alloc_port()));
         let noise_estimate = 1e-6;
-        let mut spawner = SockSpawner::new(
-            SockSourceConfig {
+        let mut spawner = PpsSpawner::new(
+            PpsSourceConfig {
                 path: socket_path.clone(),
                 measurement_noise_estimate: noise_estimate,
+                period: 1.,
             },
             SourceConfig::default(),
         );
@@ -112,8 +114,8 @@ mod tests {
         let SpawnAction::Create(create_params) = res.action;
         assert_eq!(create_params.get_addr(), socket_path.display().to_string());
 
-        let SourceCreateParameters::Sock(params) = create_params else {
-            panic!("did not receive sock source create parameters!");
+        let SourceCreateParameters::Pps(params) = create_params else {
+            panic!("did not receive PPS source create parameters!");
         };
         assert_eq!(params.path, socket_path);
         assert!((params.noise_estimate - noise_estimate).abs() < 1e-9);

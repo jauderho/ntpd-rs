@@ -1,6 +1,6 @@
 use std::{net::SocketAddr, path::PathBuf, sync::atomic::AtomicU64};
 
-use ntp_proto::{ProtocolVersion, SourceNtsData};
+use ntp_proto::{ProtocolVersion, SourceConfig, SourceNtsData};
 use serde::{Deserialize, Serialize};
 use tokio::{
     sync::mpsc,
@@ -13,6 +13,7 @@ pub mod nts;
 #[cfg(feature = "unstable_nts-pool")]
 pub mod nts_pool;
 pub mod pool;
+pub mod pps;
 pub mod sock;
 pub mod standard;
 
@@ -118,6 +119,7 @@ impl SpawnAction {
         addr: SocketAddr,
         normalized_addr: NormalizedAddress,
         protocol_version: ProtocolVersion,
+        config: SourceConfig,
         nts: Option<Box<SourceNtsData>>,
     ) -> SpawnAction {
         SpawnAction::Create(SourceCreateParameters::Ntp(NtpSourceCreateParameters {
@@ -125,6 +127,7 @@ impl SpawnAction {
             addr,
             normalized_addr,
             protocol_version,
+            config,
             nts,
         }))
     }
@@ -134,6 +137,7 @@ impl SpawnAction {
 pub enum SourceCreateParameters {
     Ntp(NtpSourceCreateParameters),
     Sock(SockSourceCreateParameters),
+    Pps(PpsSourceCreateParameters),
 }
 
 impl SourceCreateParameters {
@@ -141,13 +145,15 @@ impl SourceCreateParameters {
         match self {
             Self::Ntp(params) => params.id,
             Self::Sock(params) => params.id,
+            Self::Pps(params) => params.id,
         }
     }
 
     pub fn get_addr(&self) -> String {
         match self {
             Self::Ntp(params) => params.addr.to_string(),
-            Self::Sock(params) => params.path.clone().display().to_string(),
+            Self::Sock(params) => params.path.display().to_string(),
+            Self::Pps(params) => params.path.display().to_string(),
         }
     }
 }
@@ -158,6 +164,7 @@ pub struct NtpSourceCreateParameters {
     pub addr: SocketAddr,
     pub normalized_addr: NormalizedAddress,
     pub protocol_version: ProtocolVersion,
+    pub config: SourceConfig,
     pub nts: Option<Box<SourceNtsData>>,
 }
 
@@ -165,7 +172,17 @@ pub struct NtpSourceCreateParameters {
 pub struct SockSourceCreateParameters {
     pub id: SourceId,
     pub path: PathBuf,
+    pub config: SourceConfig,
     pub noise_estimate: f64,
+}
+
+#[derive(Debug)]
+pub struct PpsSourceCreateParameters {
+    pub id: SourceId,
+    pub path: PathBuf,
+    pub config: SourceConfig,
+    pub noise_estimate: f64,
+    pub period: f64,
 }
 
 #[async_trait::async_trait]

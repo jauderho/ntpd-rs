@@ -1,4 +1,5 @@
 use crate::daemon::{
+    pps_source::PpsSourceTask,
     sock_source::SockSourceTask,
     spawn::{spawner_task, SourceCreateParameters},
 };
@@ -11,8 +12,9 @@ use super::{
     ntp_source::{MsgForSystem, SourceChannels, SourceTask, Wait},
     server::{ServerStats, ServerTask},
     spawn::{
-        nts::NtsSpawner, pool::PoolSpawner, sock::SockSpawner, standard::StandardSpawner, SourceId,
-        SourceRemovalReason, SpawnAction, SpawnEvent, Spawner, SpawnerId, SystemEvent,
+        nts::NtsSpawner, pool::PoolSpawner, pps::PpsSpawner, sock::SockSpawner,
+        standard::StandardSpawner, SourceId, SourceRemovalReason, SpawnAction, SpawnEvent, Spawner,
+        SpawnerId, SystemEvent,
     },
 };
 
@@ -26,7 +28,7 @@ use std::{
 };
 
 use ntp_proto::{
-    KeySet, NtpClock, ObservableSourceState, SourceDefaultsConfig, SynchronizationConfig, System,
+    KeySet, NtpClock, ObservableSourceState, SourceConfig, SynchronizationConfig, System,
     SystemActionIterator, SystemSnapshot, SystemSourceUpdate, TimeSyncController,
 };
 use timestamped_socket::interface::InterfaceName;
@@ -91,7 +93,7 @@ pub struct DaemonChannels {
 pub async fn spawn<Controller: TimeSyncController<Clock = NtpClockWrapper, SourceId = SourceId>>(
     synchronization_config: SynchronizationConfig,
     algorithm_config: Controller::AlgorithmConfig,
-    source_defaults_config: SourceDefaultsConfig,
+    source_defaults_config: SourceConfig,
     clock_config: ClockConfig,
     source_configs: &[NtpSourceConfig],
     server_configs: &[ServerConfig],
@@ -105,7 +107,6 @@ pub async fn spawn<Controller: TimeSyncController<Clock = NtpClockWrapper, Sourc
         clock_config.timestamp_mode,
         synchronization_config,
         algorithm_config,
-        source_defaults_config,
         keyset,
         ip_list,
         !source_configs.is_empty(),
@@ -115,7 +116,10 @@ pub async fn spawn<Controller: TimeSyncController<Clock = NtpClockWrapper, Sourc
         match source_config {
             NtpSourceConfig::Standard(cfg) => {
                 system
-                    .add_spawner(StandardSpawner::new(cfg.clone()))
+                    .add_spawner(StandardSpawner::new(
+                        cfg.first.clone(),
+                        cfg.second.clone().with_defaults(source_defaults_config),
+                    ))
                     .map_err(|e| {
                         tracing::error!("Could not spawn source: {}", e);
                         std::io::Error::new(std::io::ErrorKind::Other, e)
@@ -123,7 +127,10 @@ pub async fn spawn<Controller: TimeSyncController<Clock = NtpClockWrapper, Sourc
             }
             NtpSourceConfig::Nts(cfg) => {
                 system
-                    .add_spawner(NtsSpawner::new(cfg.clone()))
+                    .add_spawner(NtsSpawner::new(
+                        cfg.first.clone(),
+                        cfg.second.clone().with_defaults(source_defaults_config),
+                    ))
                     .map_err(|e| {
                         tracing::error!("Could not spawn source: {}", e);
                         std::io::Error::new(std::io::ErrorKind::Other, e)
@@ -131,7 +138,10 @@ pub async fn spawn<Controller: TimeSyncController<Clock = NtpClockWrapper, Sourc
             }
             NtpSourceConfig::Pool(cfg) => {
                 system
-                    .add_spawner(PoolSpawner::new(cfg.clone()))
+                    .add_spawner(PoolSpawner::new(
+                        cfg.first.clone(),
+                        cfg.second.clone().with_defaults(source_defaults_config),
+                    ))
                     .map_err(|e| {
                         tracing::error!("Could not spawn source: {}", e);
                         std::io::Error::new(std::io::ErrorKind::Other, e)
@@ -140,7 +150,10 @@ pub async fn spawn<Controller: TimeSyncController<Clock = NtpClockWrapper, Sourc
             #[cfg(feature = "unstable_nts-pool")]
             NtpSourceConfig::NtsPool(cfg) => {
                 system
-                    .add_spawner(NtsPoolSpawner::new(cfg.clone()))
+                    .add_spawner(NtsPoolSpawner::new(
+                        cfg.first.clone(),
+                        cfg.second.clone().with_defaults(source_defaults_config),
+                    ))
                     .map_err(|e| {
                         tracing::error!("Could not spawn source: {}", e);
                         std::io::Error::new(std::io::ErrorKind::Other, e)
@@ -148,7 +161,15 @@ pub async fn spawn<Controller: TimeSyncController<Clock = NtpClockWrapper, Sourc
             }
             NtpSourceConfig::Sock(cfg) => {
                 system
-                    .add_spawner(SockSpawner::new(cfg.clone()))
+                    .add_spawner(SockSpawner::new(cfg.clone(), source_defaults_config))
+                    .map_err(|e| {
+                        tracing::error!("Could not spawn source: {}", e);
+                        std::io::Error::new(std::io::ErrorKind::Other, e)
+                    })?;
+            }
+            NtpSourceConfig::Pps(cfg) => {
+                system
+                    .add_spawner(PpsSpawner::new(cfg.clone(), source_defaults_config))
                     .map_err(|e| {
                         tracing::error!("Could not spawn source: {}", e);
                         std::io::Error::new(std::io::ErrorKind::Other, e)
@@ -224,7 +245,6 @@ impl<
         timestamp_mode: TimestampMode,
         synchronization_config: SynchronizationConfig,
         algorithm_config: Controller::AlgorithmConfig,
-        source_defaults_config: SourceDefaultsConfig,
         keyset: tokio::sync::watch::Receiver<Arc<KeySet>>,
         ip_list: tokio::sync::watch::Receiver<Arc<[IpAddr]>>,
         have_sources: bool,
@@ -232,7 +252,6 @@ impl<
         let Ok(mut system) = System::new(
             clock.clone(),
             synchronization_config,
-            source_defaults_config,
             algorithm_config,
             ip_list.borrow().clone(),
         ) else {
@@ -493,6 +512,7 @@ impl<
             SourceCreateParameters::Ntp(ref mut params) => {
                 let (source, initial_actions) = self.system.create_ntp_source(
                     source_id,
+                    params.config,
                     params.addr,
                     params.protocol_version,
                     params.nts.take(),
@@ -515,10 +535,31 @@ impl<
                 );
             }
             SourceCreateParameters::Sock(ref params) => {
-                let source = self
-                    .system
-                    .create_sock_source(source_id, params.noise_estimate)?;
+                let source = self.system.create_sock_source(
+                    source_id,
+                    params.config,
+                    params.noise_estimate,
+                )?;
                 SockSourceTask::spawn(
+                    source_id,
+                    params.path.clone(),
+                    self.clock.clone(),
+                    SourceChannels {
+                        msg_for_system_sender: self.msg_for_system_tx.clone(),
+                        system_update_receiver: self.system_update_sender.subscribe(),
+                        source_snapshots: self.source_snapshots.clone(),
+                    },
+                    source,
+                );
+            }
+            SourceCreateParameters::Pps(ref params) => {
+                let source = self.system.create_pps_source(
+                    source_id,
+                    params.config,
+                    params.noise_estimate,
+                    params.period,
+                )?;
+                PpsSourceTask::spawn(
                     source_id,
                     params.path.clone(),
                     self.clock.clone(),

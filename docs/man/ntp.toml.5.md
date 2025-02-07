@@ -42,23 +42,33 @@ with any of these options:
     requires that both the client and server have a rough idea of the current
     time.
 
+`sock`
+:   A sock source connects to a GPSd socket to get timing data from GPS
+    receivers. Note that GPSd must be (re-)started after starting ntpd-rs for
+    GPSd to connect to the socket.
+
+`pps`
+:   A PPS source connects to a Pulse Per Second device, which is by default
+    assumed to send a pulse every rounded second. As these devices only
+    provide periodic data, they do not count towards `minimum-agreeing-sources`.
+
 # CONFIGURATION
 
 ## `[source-defaults]`
-Some values are shared between all sources in the daemon. You can configure
-these in the `[source-defaults]` section.
+Some of the behavior of a source is configurable. You can set defaults for those
+settings in the `[source-defaults]` section.
 
 `poll-interval-limits` = { `min` = *min*, `max` = *max* } (**{ min = 4, max = 10}**)
 :   Specifies the limit on how often a source is queried for a new time. For
     most instances the defaults will be adequate. The min and max are given as
     the log2 of the number of seconds (i.e. two to the power of the interval).
-    An interval of 4 equates to 32 seconds, 10 results in an interval of 1024
+    An interval of 4 equates to 16 seconds, 10 results in an interval of 1024
     seconds. If specified, both min and max must be specified.
 
 `initial-poll-interval` = *interval* (**4**)
 :   Initial poll interval used on startup. The value is given as the log2 of
     the number of seconds (i.e. two to the power of the interval). The default
-    value of 4 results in an interval of 32 seconds.
+    value of 4 results in an interval of 16 seconds.
 
 ## `[[source]]`
 Each `[[source]]` is a set of one or more time sources for the daemon to
@@ -71,9 +81,9 @@ synchronized to the local clock. Note that a pool counts as multiple time
 sources.
 
 `mode` = *mode*
-:   Specify one of the source modes that ntpd-rs supports: `server`, `pool` or
-    `nts`. For a description of the different source modes, see the
-    *SOURCE MODES* section.
+:   Specify one of the source modes that ntpd-rs supports: `server`, `pool`,
+    `nts`, `sock` or `pps`. For a description of the different source modes, see
+    the *SOURCE MODES* section.
 
 `address` = *address*
 :   Specify the remote address of the source. For server sources this will be
@@ -100,6 +110,19 @@ sources.
 `ignore` = *ip addresses*
 :   `pool` mode only. Specifies a list of IP addresses of servers in the pool
     which should not be used. For example: `["127.0.0.1"]`. Empty by default.
+
+`poll-interval-limits` = { `min` = *min*, `max` = *max* } (defaults from `[source-defaults]`)
+:   Specifies the limit on how often a source is queried for a new time. For
+    most instances the defaults will be adequate. The min and max are given as
+    the log2 of the number of seconds (i.e. two to the power of the interval).
+    An interval of 4 equates to 16 seconds, 10 results in an interval of 1024
+    seconds. If only one of the two boundaries is specified, the other is
+    inherited from `[source-defaults]`
+
+`initial-poll-interval` = *interval* (defaults from `[source-defaults]`)
+:   Initial poll interval used on startup. The value is given as the log2 of
+    the number of seconds (i.e. two to the power of the interval). The default
+    value of 4 results in an interval of 16 seconds.
 
 ## `[[server]]`
 The NTP daemon can be configured to distribute time via any number of
