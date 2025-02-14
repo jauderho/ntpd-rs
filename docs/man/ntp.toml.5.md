@@ -111,6 +111,15 @@ sources.
 :   `pool` mode only. Specifies a list of IP addresses of servers in the pool
     which should not be used. For example: `["127.0.0.1"]`. Empty by default.
 
+`measurement_noise_estimate` = *Noise variance (seconds squared)*
+:   `pps` and `sock` mode only. Deprecated, use `precision` instead.
+
+`precision` = *Noise standard deviation (seconds)*
+:   `pps` and `sock` mode only. Precision of the source. This should be an estimate
+    of the size of the expected measurement noise. Technically defined as the
+    1-standard deviation bound on the measurement error. This is needed as
+    `sock` and `pps` sources don't have a good way to estimate their own error.
+
 `poll-interval-limits` = { `min` = *min*, `max` = *max* } (defaults from `[source-defaults]`)
 :   Specifies the limit on how often a source is queried for a new time. For
     most instances the defaults will be adequate. The min and max are given as
@@ -336,6 +345,10 @@ time sources is gathered and applied to the system clock.
     been configured, or when the time has not yet been synchronized from an NTP
     time source. Can be used in servers to indicate that there are external
     mechanisms synchronizing the clock.
+
+`reference-id` = *reference-id* (**XNON**)
+:   Sets the reported NTP clock reference id when local-statum is set to `1`.
+    This is used to indicate the source of the time reference (`GPS` etc.).
 
 ## `[synchronization.algorithm]`
 Warning: the algorithm section contains mostly internal algorithm tweaks that
