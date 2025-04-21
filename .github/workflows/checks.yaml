@@ -111,7 +111,7 @@ jobs:
         env:
           RUST_BACKTRACE: 1
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@cf3f51a67d2820f7a7cefa0831889fbbef41ca57
+        uses: codecov/codecov-action@ad3126e916f78f00edff4ed0317cf185271ccc2d
         with:
           files: lcov.info
           token: ${{ secrets.CODECOV_TOKEN }}
