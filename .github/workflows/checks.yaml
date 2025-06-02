@@ -97,7 +97,7 @@ jobs:
         with:
           target: ${{ matrix.target }}
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@6c6479b49816fcc0975a31af977bdc1f847c2920
+        uses: taiki-e/install-action@735e5933943122c5ac182670a935f54a949265c1
         with:
           tool: cargo-llvm-cov
       - name: Rust cache
@@ -130,7 +130,7 @@ jobs:
         with:
           toolchain: nightly
       - name: Install udeps
-        uses: taiki-e/install-action@6c6479b49816fcc0975a31af977bdc1f847c2920
+        uses: taiki-e/install-action@735e5933943122c5ac182670a935f54a949265c1
         with:
           tool: cargo-udeps
       - name: cargo udeps
@@ -234,7 +234,7 @@ jobs:
           version: 0.9.0
         if: ${{matrix.use_zig}}
       - name: Install cargo-zigbuild
-        uses: taiki-e/install-action@6c6479b49816fcc0975a31af977bdc1f847c2920
+        uses: taiki-e/install-action@735e5933943122c5ac182670a935f54a949265c1
         with:
           tool: cargo-zigbuild
         if: ${{matrix.use_zig}}
