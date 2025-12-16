@@ -44,7 +44,7 @@ jobs:
         run: RELEASE_TARGETS="${{ matrix.target }}" utils/build-release.sh
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: release-binaries-${{ matrix.target }}
           path: target/pkg/
@@ -66,7 +66,7 @@ jobs:
           rm -rf SHA256SUMS
           sha256sum -b * > SHA256SUMS
       - name: Upload artifacts
-        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: release-binaries
           path: target/pkg/
