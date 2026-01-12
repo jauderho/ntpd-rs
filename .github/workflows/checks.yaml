@@ -93,7 +93,7 @@ jobs:
         run: cargo +nightly update -Z direct-minimal-versions
         if: ${{ matrix.rust == 'msrv' }}
       - name: Install cross-compilation tools
-        uses: taiki-e/setup-cross-toolchain-action@15a579e0045e5e4f668b73a441b9609884abffc9
+        uses: taiki-e/setup-cross-toolchain-action@d30d20f04a3b09718e138524795d0d6ab7703dcb
         with:
           target: ${{ matrix.target }}
       - name: Install cargo-llvm-cov
