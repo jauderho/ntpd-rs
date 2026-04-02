@@ -742,9 +742,9 @@ dependencies = [
 
 [[package]]
 name = "timestamped-socket"
-version = "0.2.7"
+version = "0.2.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "33d281d46f6b275c61bbe9ca3b55613c39018586dccbc537456ecaac7bb5377a"
+checksum = "4f968af71a51b915706b71490d332a64de3981c3487be10c7531c1ac3d493316"
 dependencies = [
  "libc",
  "serde",
